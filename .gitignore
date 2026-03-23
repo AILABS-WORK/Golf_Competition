@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Data files (too large for git)
+parameter-golf/data/datasets/
+parameter-golf/data/tokenizers/
+parameter-golf/.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+firebase-debug.log
+
+# Training artifacts (track metrics only, not full models)
+runs/*/model_*.bin
+runs/*/checkpoint_*.pt
+
+# Image files
+*.png
