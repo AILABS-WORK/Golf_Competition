@@ -167,11 +167,17 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 - **Expected gain**: −0.010 to −0.020 BPB. High potential because it addresses a fundamental information bottleneck
 
 ### MoLE — Mixture of Lookup Experts (arXiv:2503.15798, ICML 2025 Oral)
-- **What**: K expert embedding tables, each indexed by token ID. Routing gate (softmax) weights their contributions
-- **Why it works**: Generalizes BigramHash — instead of one hash function over bigrams, uses K learned expert distributions over unigrams with learned routing. The routing gate can specialize: expert 1 for nouns, expert 2 for verbs, etc.
-- **Zero FLOPs advantage**: Table lookup is O(K) memory operations vs O(D²) for a linear layer
-- **Expected gain**: −0.015 to −0.030 BPB (superior to BigramHash if correctly tuned)
-- **Competition advantage**: Not present in ANY local competition submission → true novel advantage
+- **What**: K small 2-layer FFN experts, each applied to the **token embedding** `e_i`. Expert outputs combined via learned routing gate `g_i = Softmax(W_r * input)`. Final output added to shared dense FFN: `y = FFN_shared(h) + Σ g_{i,k} * f_k(e_i)`.
+- **Paper vs codebase routing**:
+  - **Paper**: `g_i = Softmax(W_r * h_i)` — routes from **hidden state** (context-sensitive, runs at inference)
+  - **Codebase**: `gate = nn.Embedding(vocab_size, num_experts)[token_id]` — routes from **token ID only** (context-free, fully re-parameterizable at test time → **zero inference FLOPs**)
+  - The codebase variant is pragmatically sound for competition (zero-FLop inference advantage) but loses context-dependent routing.
+- **Expert structure**: Each expert `f_k(e_i) = W_{k2}(σ(W_{k1}(e_i)))` where `W_k1: embed_dim→d_int`, `W_k2: d_int→model_dim`. Sweet spot from ablations: `d_int = 4 × embed_dim`, `K = 16`.
+- **Relationship to BigramHash**: Complementary, not competing. BigramHash encodes 2-token context; MoLE encodes richer per-token statistics via basis decomposition. Both active together is the optimal setting.
+- **Optimal hyperparameters** (for our vocab_size=1024): `MOLE_NUM_EXPERTS=16, MOLE_DIM=64` → ~1.1M extra params. d_int=16× saturates because the LUT capacity (1024 vocab entries) becomes the bottleneck at larger expert widths.
+- **Expected gain**: −0.005 to −0.015 BPB over BigramHash baseline (codebase already has BigramHash). If replacing BigramHash: −0.015 to −0.030 BPB.
+- **Routing**: Dense softmax (all K experts always active). Sparse routing with aux losses **hurts** in MoLE — all K outputs always weighted.
+- **Competition advantage**: Not present in any competition submission → true novel advantage. Deep-dive at `research/evidence/papers/mole_deep_dive.md`.
 
 ### TWEO / Anti-Outlier Training (arXiv:2511.23225, ICLR 2026)
 - **What**: Add colinearity penalty: `λ × ||W@W.T - diag(W@W.T)||_F²`
