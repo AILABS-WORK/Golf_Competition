@@ -2254,6 +2254,7 @@ class GPT(nn.Module):
         ssnorm: bool = False,
         diff_attn: bool = False,
         peri_ln: bool = False,
+        gated_attn: bool = False,
         denseformer: bool = False,
         mudd_streams: int = 0,
     ):
@@ -2555,6 +2556,7 @@ def main() -> None:
         ssnorm=args.ssnorm,
         diff_attn=args.diff_attn,
         peri_ln=args.peri_ln,
+        gated_attn=args.gated_attn,
         denseformer=args.denseformer,
         mudd_streams=args.mudd_streams,
     ).to(device).bfloat16()
