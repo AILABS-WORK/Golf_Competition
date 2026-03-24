@@ -338,6 +338,13 @@ class Hyperparameters:
     #   Non-distributed: each GPU processes its own chunks independently.
     #   Momentum buffers reset per-chunk (chunk context changes completely each time).
     ttt_muon = bool(int(os.environ.get("TTT_MUON", 0)))  # Muon for LoRA A+B adapters
+    # V155: Path-integral EWC Fisher (SI-style, arXiv:1703.04200 + arXiv:2507.18807).
+    #   FIX for V132 critical bug: v_t at convergence ≈ 0 because gradients vanish.
+    #   Accumulated Squisher: running mean of v_t over ALL inner-loop epochs.
+    #   Captures importance when gradients were LARGE (early training), not after vanishing.
+    #   Strictly better than post-hoc Fisher; zero extra FLOPs (reads existing Adam state).
+    #   Requires ttt_ewc_lambda > 0 to be active (uses same EWC penalty infrastructure).
+    ttt_ewc_path_integral = bool(int(os.environ.get("TTT_EWC_PATH_INTEGRAL", 0)))
 
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
@@ -1114,6 +1121,9 @@ def _eval_val_lora_ttt(
         # each document is independent so cross-chunk momentum would add noise)
         if args.ttt_muon:
             _muon_bufs.clear()
+        # V155: path-integral Fisher accumulator (running mean of Adam v_t over all epochs).
+        # Accumulates as [sum_A, sum_B, step_count]; normalized to mean at end of loop.
+        _pi_accum: dict[str, list] = {}  # nm -> [sum_vA, sum_vB, count]
 
         for epoch in range(n_epochs):
             t_inner = epoch / max(n_epochs - 1, 1)
@@ -1223,6 +1233,21 @@ def _eval_val_lora_ttt(
                         nB = mod._lora_B.norm()
                         if nB > args.ttt_norm_budget:
                             mod._lora_B.mul_(args.ttt_norm_budget / nB)
+            # V155: path-integral Fisher accumulation — add v_t from this epoch.
+            # Gradients are largest early in training (not at convergence), so averaging
+            # all epochs' v_t captures meaningful importance signal (Squisher, arXiv:2507.18807).
+            if args.ttt_ewc_path_integral and args.ttt_ewc_lambda > 0.0 and not args.ttt_muon:
+                for nm, mod, _, _ in lora_targets:
+                    _sA = ttt_opt.state.get(mod._lora_A, {})
+                    _sB = ttt_opt.state.get(mod._lora_B, {})
+                    if "exp_avg_sq" in _sA and "exp_avg_sq" in _sB:
+                        if nm not in _pi_accum:
+                            _pi_accum[nm] = [_sA["exp_avg_sq"].detach().clone(),
+                                             _sB["exp_avg_sq"].detach().clone(), 1]
+                        else:
+                            _pi_accum[nm][0].add_(_sA["exp_avg_sq"])
+                            _pi_accum[nm][1].add_(_sB["exp_avg_sq"])
+                            _pi_accum[nm][2] += 1
 
             # Min-NLL: snapshot LoRA at the epoch with the lowest NLL
             if args.ttt_min_nll and loss.item() < best_nll:
@@ -1236,18 +1261,27 @@ def _eval_val_lora_ttt(
                 mod._lora_A = best_lora[nm][0]
                 mod._lora_B = best_lora[nm][1]
 
-        # V132 Fisher extraction: save Adam exp_avg_sq as cross-chunk Fisher approximation.
-        # Adam second moment v_t = EMA(g²) is the standard diagonal Fisher estimate.
-        # Stored BEFORE Two-Phase RELI (so phase-1 state is the anchor, not phase-2).
-        if args.ttt_ewc_lambda > 0.0:
+        # V132/V155 Fisher extraction: stored BEFORE Two-Phase RELI.
+        # V132: take final Adam exp_avg_sq (EMA of g²) — post-hoc, may be near-zero at convergence.
+        # V155: path-integral average of all epochs' v_t — captures peak gradient signal.
+        if args.ttt_ewc_lambda > 0.0 and not args.ttt_muon:
             _new_fisher: dict[str, tuple[Tensor, Tensor]] = {}
             _new_anchor: dict[str, tuple[Tensor, Tensor]] = {}
             for nm, mod, _, _ in lora_targets:
-                _sA = ttt_opt.state.get(mod._lora_A, {})
-                _sB = ttt_opt.state.get(mod._lora_B, {})
-                if "exp_avg_sq" in _sA and "exp_avg_sq" in _sB:
-                    _new_fisher[nm] = (_sA["exp_avg_sq"].detach().clone(),
-                                       _sB["exp_avg_sq"].detach().clone())
+                if args.ttt_ewc_path_integral and nm in _pi_accum:
+                    # Path-integral: normalized mean over all inner-loop epochs
+                    cnt = max(1, _pi_accum[nm][2])
+                    fA = _pi_accum[nm][0] / cnt
+                    fB = _pi_accum[nm][1] / cnt
+                    _new_fisher[nm] = (fA, fB)
+                else:
+                    # V132: final v_t (may vanish at convergence — use V155 to fix)
+                    _sA = ttt_opt.state.get(mod._lora_A, {})
+                    _sB = ttt_opt.state.get(mod._lora_B, {})
+                    if "exp_avg_sq" in _sA and "exp_avg_sq" in _sB:
+                        _new_fisher[nm] = (_sA["exp_avg_sq"].detach().clone(),
+                                           _sB["exp_avg_sq"].detach().clone())
+                if nm in _new_fisher:
                     _new_anchor[nm] = (mod._lora_A.detach().clone(),
                                        mod._lora_B.detach().clone())
             if _new_fisher:

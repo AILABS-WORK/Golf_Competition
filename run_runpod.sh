@@ -977,6 +977,14 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V153" ]]; the
     "$CHIMERA_BASE TTT_MUON=1 TTT_RELI=1"
 fi
 
+if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V155" ]]; then
+  # Path-integral EWC Fisher (SI-style): accumulate v_t over ALL epochs, not just at convergence.
+  # Fixes V132 critical bug: at convergence gradients ≈ 0 → Fisher ≈ 0 → EWC has no effect.
+  # Accumulated Squisher (arXiv:2507.18807): running mean of Adam v_t captures peak signal.
+  run_rp "V155_pi_ewc" \
+    "$CHIMERA_BASE TTT_EWC_LAMBDA=0.05 TTT_EWC_PATH_INTEGRAL=1"
+fi
+
 if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V154" ]]; then
   # Max Tier 22: Muon + top-3 MLP-only + RELI + rsLoRA + norm bound + KD.
   # Full research-validated stack: geometry + layer targeting + convergence + anti-forgetting.
