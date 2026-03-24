@@ -304,6 +304,11 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 - **Expected gain**: −0.002 to −0.006 BPB (alternative to HybridNorm, test one)
 - **Control var**: `PERI_LN=1` (mutually exclusive with HYBRID_NORM) → V93-V94 in run_runpod.sh
 
+#### ✅ DenseFormer — Depth-Weighted Average (arXiv:2402.02622, NeurIPS 2024) **IMPLEMENTED**
+- **What**: Replaces U-Net skip connections with learned softmax-weighted sum over ALL prior layer outputs. Only L*(L+1)/2 = 66 extra scalars for L=11. Subsumes standard residual at initialization (identity init).
+- **Expected gain**: −0.008 to −0.015 BPB
+- **Control var**: `DENSEFORMER=1` → V98 in run_runpod.sh
+
 ### Summary Table
 
 | Paper | arXiv | Tier | Expected BPB | Complexity | Status |
@@ -319,6 +324,7 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 | MASA | 2508.04581 | B | −0.005/−0.015 | High | todo |
 | AGGC | 2601.11864 | B | −0.001/−0.004 | Low | ✅ AGGC_BETA=0.99 |
 | Peri-LN | 2502.02732 | B | −0.002/−0.006 | Low | ✅ PERI_LN=1 |
+| DenseFormer DWA | 2402.02622 | B | −0.008/−0.015 | Trivial | ✅ DENSEFORMER=1 |
 
 *Stacking all Tier S+A techniques (assuming 0.6× synergy discount): estimated −0.050 to −0.100 BPB over existing SOTA stack.*
 

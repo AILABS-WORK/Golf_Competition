@@ -371,6 +371,17 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier8" || "$TARGET" == "V97" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 9 — DenseFormer: Depth-Weighted Averaging (arXiv:2402.02622, NeurIPS 2024)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   V98: DenseFormer on full SOTA — replaces U-Net skips with learned DWA (66 scalars)
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier9" || "$TARGET" == "V98" ]]; then
+  run_rp "V98_denseformer" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT DENSEFORMER=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

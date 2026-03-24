@@ -18,6 +18,7 @@
 #   bash run_benchmark.sh diff_attn       # Differential Transformer ablations (V90-V92)
 #   bash run_benchmark.sh peri_ln         # Peri-LN ablations (V93-V94)
 #   bash run_benchmark.sh aggc            # Adaptive Group Gradient Clipping (V97)
+#   bash run_benchmark.sh denseformer     # DenseFormer DWA cross-layer aggregation (V98)
 #   bash run_benchmark.sh V44             # single variant by ID
 #
 # Output:
@@ -642,6 +643,17 @@ if [[ "$TARGET" == "aggc" || "$TARGET" == "V97" ]]; then
     "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
      GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
      AGGC_BETA=0.99 AGGC_THRESHOLD=3.0"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DENSEFORMER GROUP (V98) — Depth-Weighted Average arXiv:2402.02622 (NeurIPS 2024)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "denseformer" || "$TARGET" == "V98" ]]; then
+  run_bench "V98_denseformer" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     DENSEFORMER=1"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

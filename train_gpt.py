@@ -246,6 +246,10 @@ class Hyperparameters:
     # Strictly a superset of HybridNorm; mutually exclusive (don't use both).
     # Post-Norm on attention stabilizes the attention output distribution → better int6 QAT.
     peri_ln = bool(int(os.environ.get("PERI_LN", 0)))
+    # DenseFormer: depth-weighted average over all prior block outputs (arXiv:2402.02622).
+    # Replaces U-Net skip connections with softmax-weighted sum across all layers.
+    # Only L*(L+1)/2 = 66 extra scalars for L=11; 0 extra FLOPs vs U-Net.
+    denseformer = bool(int(os.environ.get("DENSEFORMER", 0)))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1300,6 +1304,33 @@ class MixtureOfLookupExperts(nn.Module):
         return self.proj(combined)
 
 
+class DWA(nn.Module):
+    """Depth-Weighted Average — DenseFormer cross-layer aggregation (arXiv:2402.02622).
+
+    For an L-layer model, maintains L weight vectors: weights[i] has shape (i+1,).
+    At call dwa(i, all_hidden): softmax-normalizes weights[i] and returns a weighted
+    sum of all_hidden[0..i]. Identity-initialized: each layer primarily uses its own
+    most recent output (standard residual behavior at t=0).
+
+    Total extra parameters: sum_{i=0}^{L-1} (i+1) = L*(L+1)/2
+    For L=11: 11*12/2 = 66 scalars. Negligible overhead.
+    """
+
+    def __init__(self, n_layers: int):
+        super().__init__()
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.zeros(i + 1)) for i in range(n_layers)
+        ])
+        # Identity init: concentrate on most recent output (index i)
+        for i, w in enumerate(self.weights):
+            w.data[i] = 1.0
+
+    def forward(self, layer_idx: int, all_hidden: list[Tensor]) -> Tensor:
+        w = F.softmax(self.weights[layer_idx], dim=0)
+        H = torch.stack(all_hidden, dim=0)  # (n_prior, B, T, D)
+        return (w[:, None, None, None] * H).sum(dim=0)  # (B, T, D)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1334,6 +1365,7 @@ class GPT(nn.Module):
         ssnorm: bool = False,
         diff_attn: bool = False,
         peri_ln: bool = False,
+        denseformer: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1378,6 +1410,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.dwa = DWA(num_layers) if denseformer else None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -1427,8 +1460,31 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
+        # DenseFormer: replace U-Net skips with DWA cross-layer aggregation.
+        if self.dwa is not None:
+            all_hidden: list[Tensor] = []
+            v_first: Tensor | None = None
+            for i in range(self.num_encoder_layers):
+                if all_hidden:
+                    x = self.dwa(len(all_hidden) - 1, all_hidden)
+                if self.value_residual:
+                    x, v_raw = self.blocks[i](x, x0, v_first)
+                    if i == 0:
+                        v_first = v_raw
+                else:
+                    x = self.blocks[i](x, x0)
+                all_hidden.append(x)
+            for i in range(self.num_decoder_layers):
+                bi = self.num_encoder_layers + i
+                x = self.dwa(len(all_hidden) - 1, all_hidden)
+                if self.value_residual:
+                    x, _ = self.blocks[bi](x, x0, v_first)
+                else:
+                    x = self.blocks[bi](x, x0)
+                all_hidden.append(x)
+            x = self.dwa(len(all_hidden) - 1, all_hidden)  # final DWA before output norm
         # First half stores skips; second half reuses them in reverse order.
-        if self.value_residual:
+        elif self.value_residual:
             # Value Residual: pass first-layer V to all subsequent blocks.
             # v_first starts as None; set after first block; all blocks get it.
             v_first: Tensor | None = None
@@ -1600,6 +1656,7 @@ def main() -> None:
         ssnorm=args.ssnorm,
         diff_attn=args.diff_attn,
         peri_ln=args.peri_ln,
+        denseformer=args.denseformer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
