@@ -31,6 +31,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+# enable_gqa was added in PyTorch 2.5; fall back to manual K/V repeat_interleave on older builds
+_SDPA_SUPPORTS_GQA = tuple(int(x) for x in torch.__version__.split(".")[:2] if x.isdigit()) >= (2, 5)
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------
@@ -1915,8 +1918,17 @@ class CausalSelfAttention(nn.Module):
             q1 = q1 * gain;  q2 = q2 * gain
             # Two SDPA calls sharing the same V (Ev = 2*head_dim ≠ E = head_dim, valid in PyTorch)
             use_gqa = self.num_kv_heads != self.num_heads
-            attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, enable_gqa=use_gqa)
-            attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, enable_gqa=use_gqa)
+            if not _SDPA_SUPPORTS_GQA and use_gqa:
+                g = self.num_heads // self.num_kv_heads
+                k1e = k1.repeat_interleave(g, dim=1)
+                k2e = k2.repeat_interleave(g, dim=1)
+                ve  = v.repeat_interleave(g, dim=1)
+                attn1 = F.scaled_dot_product_attention(q1, k1e, ve, is_causal=True)
+                attn2 = F.scaled_dot_product_attention(q2, k2e, ve, is_causal=True)
+            else:
+                sdpa_kw = {'enable_gqa': use_gqa} if _SDPA_SUPPORTS_GQA else {}
+                attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, **sdpa_kw)
+                attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, **sdpa_kw)
             # Lambda scalar: depth-dependent init + learned correction via dot-product pairs
             lam = (
                 torch.exp((self.lambda_q1.float() * self.lambda_k1.float()).sum())
@@ -1941,14 +1953,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if not _SDPA_SUPPORTS_GQA and self.num_kv_heads != self.num_heads:
+            g = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(g, dim=1)
+            v = v.repeat_interleave(g, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                **({'enable_gqa': (self.num_kv_heads != self.num_heads)} if _SDPA_SUPPORTS_GQA else {}),
+            )
         y = y.transpose(1, 2)  # [B, T, H, D]
         if self.gated_attn:
             # Per-head sigmoid gate (arXiv:2505.06708): eliminates attention sinks.
