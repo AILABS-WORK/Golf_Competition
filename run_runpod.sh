@@ -31,6 +31,10 @@
 
 set -e
 
+# ─── DEPENDENCY CHECK ─────────────────────────────────────────────────────────
+python -c "import sentencepiece" 2>/dev/null || pip install -q sentencepiece
+python -c "import zstandard"     2>/dev/null || pip install -q zstandard
+
 # ─── RUNPOD BASE CONFIG ────────────────────────────────────────────────────────
 # Competition-accurate settings. No Windows workarounds.
 BASE_VARS="DATA_PATH=./data/datasets/fineweb10B_sp1024 \
