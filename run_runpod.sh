@@ -382,6 +382,17 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier9" || "$TARGET" == "V98" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 10 — NuMuon: Nuclear-Norm Constrained Muon (arXiv:2603.03597)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   V99: NuMuon weight=1e-4 on full SOTA — promotes low-rank weights → better int6
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier10" || "$TARGET" == "V99" ]]; then
+  run_rp "V99_numuon" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT NUMUON_WEIGHT=1e-4"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

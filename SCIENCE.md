@@ -289,10 +289,10 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 - **Expected gain**: −0.005 to −0.015 BPB (through extra capacity from savings)
 - **Implementation complexity**: High — restructures attention module for shared dictionary.
 
-#### NuMuon (arXiv:2603.03597) *(from prior survey — near-zero effort)*
-- **What**: Nuclear-norm constrained Muon. Single optimizer parameter change (add `nuc_norm_weight=1e-4`).
+#### ✅ NuMuon (arXiv:2603.03597) **IMPLEMENTED**
+- **What**: Nuclear-norm proximal step after each Muon update. Soft-thresholds singular values of all 2D matrix params by `lr * numuon_weight`. Promotes low-rank weight structure → better int6/zstd compression.
 - **Expected gain**: −0.003 to −0.008 BPB
-- **Control var**: `NUMUON_WEIGHT=1e-4`
+- **Control var**: `NUMUON_WEIGHT=1e-4` → V99 in run_runpod.sh
 
 #### ✅ AGGC — Adaptive Group Gradient Clipping (arXiv:2601.11864) **IMPLEMENTED**
 - **What**: Per-parameter-group EMA-tracked gradient norm history → adaptive clip thresholds. Protects embedding/norm parameters (which fall through Muon to AdamW) from over-clipping.
@@ -320,7 +320,7 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 | QuaRot | 2404.00456 | A | −0.003/−0.008 | Med | pending research |
 | WSM Merging | 2507.17634 | A | −0.003/−0.006 | Low | ✅ WSM=1 |
 | MUDDFormer | 2502.12170 | A | −0.020/−0.040 | High | pending research |
-| NuMuon | 2603.03597 | A | −0.003/−0.008 | Low | pending (compressibility) |
+| NuMuon | 2603.03597 | A | −0.003/−0.008 | Low | ✅ NUMUON_WEIGHT=1e-4 |
 | MASA | 2508.04581 | B | −0.005/−0.015 | High | todo |
 | AGGC | 2601.11864 | B | −0.001/−0.004 | Low | ✅ AGGC_BETA=0.99 |
 | Peri-LN | 2502.02732 | B | −0.002/−0.006 | Low | ✅ PERI_LN=1 |

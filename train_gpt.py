@@ -250,6 +250,10 @@ class Hyperparameters:
     # Replaces U-Net skip connections with softmax-weighted sum across all layers.
     # Only L*(L+1)/2 = 66 extra scalars for L=11; 0 extra FLOPs vs U-Net.
     denseformer = bool(int(os.environ.get("DENSEFORMER", 0)))
+    # NuMuon: nuclear-norm proximal step after Muon update (arXiv:2603.03597).
+    # Soft-thresholds singular values of matrix params → low-rank weights → better int6 compression.
+    # numuon_weight is threshold = lr * numuon_weight per step. 0.0 = disabled.
+    numuon_weight = float(os.environ.get("NUMUON_WEIGHT", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1950,6 +1954,17 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        # NuMuon: nuclear-norm proximal step (arXiv:2603.03597).
+        # Soft-threshold singular values of each Muon matrix param by lr*numuon_weight.
+        # Promotes low-rank weight structure → better int6 compressibility.
+        if args.numuon_weight > 0:
+            threshold = args.numuon_weight * scale  # scale = lr_mul (annealed)
+            with torch.no_grad():
+                for p in matrix_params:
+                    U, S, Vh = torch.linalg.svd(p.float(), full_matrices=False)
+                    S = torch.clamp(S - threshold, min=0.0)
+                    p.data.copy_((U * S.unsqueeze(-2) @ Vh).to(p.dtype))
 
         # EMA: update shadow weights every step with exponential decay.
         if args.ema_enabled:

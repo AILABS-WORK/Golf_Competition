@@ -19,6 +19,7 @@
 #   bash run_benchmark.sh peri_ln         # Peri-LN ablations (V93-V94)
 #   bash run_benchmark.sh aggc            # Adaptive Group Gradient Clipping (V97)
 #   bash run_benchmark.sh denseformer     # DenseFormer DWA cross-layer aggregation (V98)
+#   bash run_benchmark.sh numuon          # NuMuon nuclear-norm proximal step (V99)
 #   bash run_benchmark.sh V44             # single variant by ID
 #
 # Output:
@@ -654,6 +655,17 @@ if [[ "$TARGET" == "denseformer" || "$TARGET" == "V98" ]]; then
     "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
      GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
      DENSEFORMER=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NUMUON GROUP (V99) — Nuclear-Norm Constrained Muon arXiv:2603.03597
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "numuon" || "$TARGET" == "V99" ]]; then
+  run_bench "V99_numuon" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     NUMUON_WEIGHT=1e-4"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
