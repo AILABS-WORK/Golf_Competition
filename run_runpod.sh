@@ -486,6 +486,84 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier15" || "$TARGET" == "V107" ]]; the
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 16 — Novel LoRA TTT Extensions (V108–V115)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Five novel extensions beyond PR #611 Chimera, pushing toward 0.44–0.51 BPB:
+#
+#  V108: MLP LoRA — rank-4 LoRA on MLP fc (0.5× LR) + proj (3× LR). Adapts
+#        factual knowledge alongside attention routing. Expected ~0.49–0.53 BPB.
+#
+#  V109: Gate Adaptation — unfreeze attn_scale/mlp_scale per block (5.6K total
+#        params, 0.05× LR). Adjusts layer contribution profile per document.
+#        Expected ~0.51–0.56 BPB (alone), likely synergistic with V108.
+#
+#  V110: RELI — Retroactive Gradient-Aligned LoRA Init. SVD of pre-TTT gradient
+#        gives A/B init aligned with the loss surface. Expected 3–5× faster
+#        convergence per chunk → ~0.49–0.54 BPB.
+#
+#  V111: Soft-Reset (decay=0.5) — cross-chunk LoRA memory instead of hard reset.
+#        Retains document context across adjacent chunks in same document.
+#        Expected ~0.50–0.55 BPB (depends on document boundary alignment).
+#
+#  V112: Difficulty-Adaptive Epochs — pre-score chunk, allocate more epochs to
+#        high-NLL (hard) chunks. Better compute allocation → ~0.50–0.55 BPB.
+#
+#  V113: Full kitchen sink — Chimera + MLP LoRA + Gates + RELI + Soft-Reset.
+#        Expected ~0.44–0.51 BPB if all techniques are additive.
+#
+#  V114: RELI + MLP LoRA (no gates/soft-reset) — test RELI x MLP synergy.
+#        Expected ~0.47–0.52 BPB.
+#
+#  V115: Chimera + Difficulty-Adaptive Epochs + RELI.
+#        Expected ~0.46–0.52 BPB.
+
+CHIMERA_BASE="$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+  $SOTA_QUANT MLP_ACTIVATION=leaky_relu2 \
+  TTT_LORA=1 TTT_EPOCHS=50 TTT_LR=3e-4 TTT_LORA_RANK_QV=8 TTT_LORA_RANK_LM=16 \
+  TTT_K_LORA=1 TTT_MIN_NLL=1 TTT_TEMPERATURE=0.98"
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V108" ]]; then
+  run_rp "V108_mlp_lora" \
+    "$CHIMERA_BASE TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V109" ]]; then
+  run_rp "V109_gate_adapt" \
+    "$CHIMERA_BASE TTT_GATE_ADAPT=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V110" ]]; then
+  run_rp "V110_reli_init" \
+    "$CHIMERA_BASE TTT_RELI=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V111" ]]; then
+  run_rp "V111_soft_reset" \
+    "$CHIMERA_BASE TTT_LORA_DECAY=0.5"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V112" ]]; then
+  run_rp "V112_difficulty_adaptive" \
+    "$CHIMERA_BASE TTT_DIFFICULTY=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V113" ]]; then
+  run_rp "V113_full_novel_stack" \
+    "$CHIMERA_BASE TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 TTT_GATE_ADAPT=1 \
+     TTT_RELI=1 TTT_LORA_DECAY=0.5"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V114" ]]; then
+  run_rp "V114_reli_plus_mlp" \
+    "$CHIMERA_BASE TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 TTT_RELI=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V115" ]]; then
+  run_rp "V115_difficulty_reli" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_DIFFICULTY=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

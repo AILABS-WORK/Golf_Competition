@@ -230,6 +230,19 @@ class Hyperparameters:
     ttt_min_nll = bool(int(os.environ.get("TTT_MIN_NLL", 0)))         # track min-NLL epoch per chunk
     ttt_temperature = float(os.environ.get("TTT_TEMPERATURE", 1.0))   # post-TTT logit temperature
 
+    # LoRA TTT novel extensions (V108–V112):
+    # MLP LoRA: add rank-r LoRA to MLP fc (0.5× LR) and proj (3× LR) — adapts factual knowledge
+    # Gate Adaptation: unfreeze attn_scale/mlp_scale per block (5.6K params, 0.05× LR)
+    # RELI: Retroactive Gradient-Aligned LoRA Init — SVD of grad for pointed initialization
+    # Soft-Reset: cross-chunk LoRA memory via decay instead of hard reset (0 = hard reset)
+    # Difficulty-Adaptive Epochs: allocate more epochs to high-NLL (hard) chunks
+    ttt_mlp_lora = bool(int(os.environ.get("TTT_MLP_LORA", 0)))
+    ttt_lora_rank_mlp = int(os.environ.get("TTT_LORA_RANK_MLP", 4))  # rank for MLP LoRA
+    ttt_gate_adapt = bool(int(os.environ.get("TTT_GATE_ADAPT", 0)))   # adapt attn/mlp scales
+    ttt_lora_decay = float(os.environ.get("TTT_LORA_DECAY", 0.0))     # soft-reset decay (0=hard reset)
+    ttt_difficulty = bool(int(os.environ.get("TTT_DIFFICULTY", 0)))   # difficulty-adaptive epochs
+    ttt_reli = bool(int(os.environ.get("TTT_RELI", 0)))               # RELI grad-aligned LoRA init
+
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
     # Key insight: merging N checkpoints from the stable-LR phase approximates LR decay
@@ -734,6 +747,13 @@ def _eval_val_lora_ttt(
 
     Evidence: PR #596 (0.6430 BPB), PR #605 (0.7227), PR #611 Chimera (0.5601 BPB).
     K-LoRA at 0.3× LR (PR #611), min-NLL epoch selection (PR #611), T=0.98 (PR #576).
+
+    Novel extensions (V108-V112):
+    - MLP LoRA (TTT_MLP_LORA): rank-r LoRA on MLP fc/proj — adapts factual knowledge
+    - Gate Adaptation (TTT_GATE_ADAPT): unfreeze attn_scale/mlp_scale per block
+    - RELI (TTT_RELI): Retroactive Gradient-Aligned LoRA Init via SVD of gradient
+    - Soft-Reset (TTT_LORA_DECAY>0): cross-chunk memory via exponential decay
+    - Difficulty-Adaptive Epochs (TTT_DIFFICULTY): more epochs for high-NLL chunks
     """
     raw_model = model
     while hasattr(raw_model, "module"):
@@ -759,14 +779,35 @@ def _eval_val_lora_ttt(
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 0.3))
         elif name == "lm_head":
             lora_targets.append((name, mod, args.ttt_lora_rank_lmhead, 1.0))
+        elif args.ttt_mlp_lora and tail == "fc":
+            # MLP fc: 0.5× LR — factual knowledge retrieval side
+            lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 0.5))
+        elif args.ttt_mlp_lora and tail == "proj" and ".mlp." in name:
+            # MLP proj: 3× LR — output projection benefits from higher LR
+            lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 3.0))
 
-    # Freeze all base parameters (only LoRA A/B will receive gradients)
+    # Collect gate adaptation targets: Block-level attn_scale / mlp_scale
+    gate_targets: list[tuple[str, nn.Parameter, Tensor]] = []  # (name, param, saved_orig)
+    if args.ttt_gate_adapt:
+        for name, mod in raw_model.named_modules():
+            # Block objects have attn_scale and mlp_scale as nn.Parameter
+            if hasattr(mod, "attn_scale") and isinstance(mod.attn_scale, nn.Parameter):
+                gate_targets.append(("attn_scale@" + name, mod.attn_scale, mod.attn_scale.data.clone()))
+            if hasattr(mod, "mlp_scale") and isinstance(mod.mlp_scale, nn.Parameter):
+                gate_targets.append(("mlp_scale@" + name, mod.mlp_scale, mod.mlp_scale.data.clone()))
+
+    # Freeze all base parameters (only LoRA A/B + gates will receive gradients)
     for p in raw_model.parameters():
         p.requires_grad_(False)
+    for _, gate_param, _ in gate_targets:
+        gate_param.requires_grad_(True)
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Soft-reset: carry previous chunk LoRA across chunks with exponential decay
+    prev_lora: dict[str, tuple[Tensor, Tensor]] = {}
 
     for chunk_idx in range(rank_chunk_start, rank_chunk_end):
         chunk_start = chunk_idx * chunk_size
@@ -782,15 +823,81 @@ def _eval_val_lora_ttt(
         x = local[:-1].unsqueeze(0)   # [1, chunk_len]
         y = local[1:].unsqueeze(0)    # [1, chunk_len]
 
+        # Difficulty-Adaptive Epochs: pre-score chunk with base model to estimate NLL
+        n_epochs = args.ttt_epochs
+        if args.ttt_difficulty and args.ttt_epochs > 0:
+            raw_model.eval()
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    base_chunk_nll = raw_model(x, y).item()
+            # Scale epochs: hard chunks (high NLL) get up to 3× more epochs
+            difficulty_scale = base_chunk_nll / 0.75  # 0.75 is reference NLL
+            n_epochs = max(5, min(3 * args.ttt_epochs, int(args.ttt_epochs * difficulty_scale)))
+
         # Per-chunk LoRA init: A ~ N(0, 1/sqrt(r)), B = 0 → delta starts at zero
+        # Soft-Reset: blend previous chunk LoRA with fresh init via decay
         param_groups = []
         for nm, mod, r, lr_mult in lora_targets:
             out_f, in_f = mod.weight.shape
-            A = torch.randn(r, in_f, device=device, dtype=torch.float32).div_(math.sqrt(r)).requires_grad_(True)
-            B = torch.zeros(out_f, r, device=device, dtype=torch.float32).requires_grad_(True)
+            if args.ttt_lora_decay > 0.0 and nm in prev_lora:
+                # Soft-reset: prev_A * decay + fresh_randn * sqrt(1 - decay²) / sqrt(r)
+                decay = args.ttt_lora_decay
+                fresh_scale = math.sqrt(1.0 - decay * decay) / math.sqrt(r)
+                A = (prev_lora[nm][0] * decay
+                     + torch.randn(r, in_f, device=device, dtype=torch.float32) * fresh_scale
+                     ).detach().requires_grad_(True)
+                B = (prev_lora[nm][1] * decay).detach().requires_grad_(True)
+            else:
+                A = torch.randn(r, in_f, device=device, dtype=torch.float32).div_(math.sqrt(r)).requires_grad_(True)
+                B = torch.zeros(out_f, r, device=device, dtype=torch.float32).requires_grad_(True)
             mod._lora_A = A
             mod._lora_B = B
             param_groups.append({"params": [A, B], "lr": base_lr * lr_mult, "_lr_mult": lr_mult})
+
+        # Gate parameters get a very small LR (0.05×) — scale is sensitive
+        if gate_targets:
+            gate_params = [gp for _, gp, _ in gate_targets]
+            param_groups.append({"params": gate_params, "lr": base_lr * 0.05, "_lr_mult": 0.05})
+
+        # RELI: Retroactive Gradient-Aligned LoRA Init
+        # Run one backward pass, SVD the gradient to get principal directions, re-init A/B
+        if args.ttt_reli:
+            raw_model.train()
+            ttt_opt_tmp = torch.optim.SGD(
+                [A for _, mod, _, _ in lora_targets for A in [mod._lora_A, mod._lora_B]],
+                lr=0.0)  # zero-LR SGD just to get grads registered
+            # Enable grad temporarily for LoRA params
+            for nm, mod, r, _ in lora_targets:
+                mod._lora_A.requires_grad_(True)
+                mod._lora_B.requires_grad_(True)
+            ttt_opt_tmp.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss_reli = raw_model(x, y)
+            loss_reli.backward()
+            # Re-init each A from SVD of A's gradient (most informative directions)
+            with torch.no_grad():
+                for nm, mod, r, _ in lora_targets:
+                    if mod._lora_A.grad is not None:
+                        g = mod._lora_A.grad.float()
+                        # SVD: g ≈ U S Vh; top-r rows of Vh = principal input directions
+                        try:
+                            U, S, Vh = torch.linalg.svd(g, full_matrices=False)
+                            scale = 0.01 / (S[0].item() + 1e-8)
+                            mod._lora_A = (Vh[:r] * scale).detach().requires_grad_(True)
+                            mod._lora_B = (U[:, :r] * (S[:r] * scale).unsqueeze(0)).detach().requires_grad_(True)
+                            # Update param_group to point to new tensors
+                            for pg in param_groups:
+                                if id(pg.get("params", [None])[0]) in (id(mod._lora_A), id(mod._lora_B)):
+                                    pg["params"] = [mod._lora_A, mod._lora_B]
+                        except Exception:
+                            pass  # fall back to random init if SVD fails
+            # Rebuild param_groups with updated tensor references
+            param_groups = []
+            for nm, mod, r, lr_mult in lora_targets:
+                param_groups.append({"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult, "_lr_mult": lr_mult})
+            if gate_targets:
+                gate_params = [gp for _, gp, _ in gate_targets]
+                param_groups.append({"params": gate_params, "lr": base_lr * 0.05, "_lr_mult": 0.05})
 
         ttt_opt = torch.optim.AdamW(param_groups, weight_decay=0.0, betas=(0.9, 0.95))
 
@@ -799,8 +906,8 @@ def _eval_val_lora_ttt(
         best_nll = float("inf")
         best_lora: dict[str, tuple[Tensor, Tensor]] = {}
 
-        for epoch in range(args.ttt_epochs):
-            t_inner = epoch / max(args.ttt_epochs - 1, 1)
+        for epoch in range(n_epochs):
+            t_inner = epoch / max(n_epochs - 1, 1)
             lr_scale = 0.5 * (1.0 + math.cos(math.pi * t_inner))
             for pg in ttt_opt.param_groups:
                 pg["lr"] = base_lr * pg["_lr_mult"] * lr_scale
@@ -823,6 +930,11 @@ def _eval_val_lora_ttt(
                 mod._lora_A = best_lora[nm][0]
                 mod._lora_B = best_lora[nm][1]
 
+        # Save LoRA state for soft-reset on next chunk
+        if args.ttt_lora_decay > 0.0:
+            prev_lora = {nm: (mod._lora_A.detach().clone(), mod._lora_B.detach().clone())
+                         for nm, mod, r, _ in lora_targets}
+
         # Score chunk; optional temperature calibration (T<1 → more confident → lower BPB)
         raw_model.eval()
         with torch.inference_mode():
@@ -841,6 +953,10 @@ def _eval_val_lora_ttt(
             del mod._lora_A
             del mod._lora_B
 
+        # Restore gate parameters to saved originals (per-chunk gate reset)
+        for _, gate_param, orig_data in gate_targets:
+            gate_param.data.copy_(orig_data)
+
         num_tokens = float(y.numel())
         val_loss_sum += chunk_loss.to(torch.float64) * num_tokens
         val_token_count += num_tokens
@@ -850,7 +966,7 @@ def _eval_val_lora_ttt(
         token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
         val_byte_count += token_bytes.to(torch.float64).sum()
 
-    # Restore base parameter gradients so training loop can continue
+    # Restore all base parameter gradients so training loop can continue
     for p in raw_model.parameters():
         p.requires_grad_(True)
     raw_model.train()
