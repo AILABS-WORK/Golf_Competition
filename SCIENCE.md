@@ -319,7 +319,7 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 | Differential Transformer | 2410.05258 | A | −0.008/−0.018 | Med | ✅ DIFF_TRANSFORMER=1 |
 | QuaRot | 2404.00456 | A | −0.003/−0.008 | Med | pending research |
 | WSM Merging | 2507.17634 | A | −0.003/−0.006 | Low | ✅ WSM=1 |
-| MUDDFormer | 2502.12170 | A | −0.020/−0.040 | High | pending research |
+| MUDDFormer | 2502.12170 | A | −0.015/−0.035 | High | ✅ MUDD_STREAMS=1/3 |
 | NuMuon | 2603.03597 | A | −0.003/−0.008 | Low | ✅ NUMUON_WEIGHT=1e-4 |
 | MASA | 2508.04581 | B | −0.005/−0.015 | High | todo |
 | AGGC | 2601.11864 | B | −0.001/−0.004 | Low | ✅ AGGC_BETA=0.99 |

@@ -254,6 +254,13 @@ class Hyperparameters:
     # Soft-thresholds singular values of matrix params → low-rank weights → better int6 compression.
     # numuon_weight is threshold = lr * numuon_weight per step. 0.0 = disabled.
     numuon_weight = float(os.environ.get("NUMUON_WEIGHT", 0.0))
+    # MUDDFormer: dynamic dense connections per Q/K/V stream (arXiv:2502.12170, ICML 2025).
+    # MUDD_STREAMS=1 → V stream only (highest per-ablation benefit).
+    # MUDD_STREAMS=3 → Q+K+V streams (full variant, ~137K params for 11 layers).
+    # Incompatible with DIFF_TRANSFORMER (V shape mismatch).
+    mudd_streams = int(os.environ.get("MUDD_STREAMS", 0))
+    if diff_attn:
+        mudd_streams = 0  # DiffAttn incompatible: V has 2*head_dim shape
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1061,7 +1068,16 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor, v_first: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        x: Tensor,
+        v_first: Tensor | None = None,
+        q_in: Tensor | None = None,
+        k_in: Tensor | None = None,
+        v_in: Tensor | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        # q_in/k_in/v_in: optional MUDD-aggregated inputs (already normed at Block level).
+        # When provided, they replace x as the input to the respective projection.
         bsz, seqlen, dim = x.shape
         if self.diff_attn:
             # Differential Transformer (arXiv:2410.05258): two sub-heads per head.
@@ -1100,9 +1116,9 @@ class CausalSelfAttention(nn.Module):
             # SubLN + fixed (1 - lambda_init) scale, as per paper §3.2
             attn = self.subln(attn) * (1.0 - self.lambda_init)
             return self.proj(attn.reshape(bsz, seqlen, dim))
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(q_in if q_in is not None else x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(k_in if k_in is not None else x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(v_in if v_in is not None else x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if self.value_residual:
             v_raw = v
             if v_first is not None:
@@ -1205,14 +1221,28 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, v_first: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        v_first: Tensor | None = None,
+        mudd_qkv: tuple[Tensor | None, Tensor | None, Tensor | None] | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         ln_s = self.ln_scale_factor
         ms = self.mlp_scale.to(dtype=x.dtype)[None, None, :]
         as_ = self.attn_scale.to(dtype=x.dtype)[None, None, :]
+        # Apply same norm+scale to MUDD stream aggregations as to the main input.
+        if mudd_qkv is not None:
+            q_m, k_m, v_m = mudd_qkv
+            q_normed = (self.attn_norm(q_m) * ln_s) if q_m is not None else None
+            k_normed = (self.attn_norm(k_m) * ln_s) if k_m is not None else None
+            v_normed = (self.attn_norm(v_m) * ln_s) if v_m is not None else None
+        else:
+            q_normed = k_normed = v_normed = None
         if self.value_residual:
-            attn_out, v_raw = self.attn(self.attn_norm(x) * ln_s, v_first)
+            attn_out, v_raw = self.attn(self.attn_norm(x) * ln_s, v_first, q_normed, k_normed, v_normed)
             if self.attn_post_norm is not None:
                 attn_out = self.attn_post_norm(attn_out)
             x = x + as_ * attn_out
@@ -1222,7 +1252,7 @@ class Block(nn.Module):
             else:
                 x = x + ms * self.mlp(self.mlp_norm(x) * ln_s)
             return x, v_raw
-        attn_out = self.attn(self.attn_norm(x) * ln_s)
+        attn_out = self.attn(self.attn_norm(x) * ln_s, None, q_normed, k_normed, v_normed)
         if self.attn_post_norm is not None:
             # Peri-LN: Post-Norm on attention output (arXiv:2502.02732, Gemma/OLMo 2).
             # Normalizes the attention sublayer output before adding to residual stream.
@@ -1335,6 +1365,44 @@ class DWA(nn.Module):
         return (w[:, None, None, None] * H).sum(dim=0)  # (B, T, D)
 
 
+class MUDDConnection(nn.Module):
+    """Single-stream DA module for MUDDFormer (arXiv:2502.12170, ICML 2025).
+
+    Generates a dynamic per-token weighted sum of all prior hidden states for
+    one stream (Q, K, or V). Weight generation: linear projection of current
+    hidden state → dot product with static learned keys → unnormalized weights.
+    NO softmax (paper ablated this and found it unhelpful).
+
+    Parameters per layer i: D*(i+1) + (i+1)² (projection + keys).
+    For 11-layer D=512: total ~137K params across all 3 streams.
+    """
+
+    def __init__(self, d_model: int, layer_idx: int):
+        super().__init__()
+        n_prior = layer_idx + 1
+        K = n_prior  # key dim = n_prior (grows with depth)
+        self.W_q = nn.Linear(d_model, K, bias=False)
+        # Static learned keys: one key vector per prior hidden state
+        self.keys = nn.Parameter(torch.zeros(n_prior, K))
+        # Identity init: select only the immediately preceding state at start
+        with torch.no_grad():
+            for j in range(K):
+                self.keys.data[j, j] = 1.0
+        # Small init for W_q so MUDD contribution starts near-zero
+        nn.init.normal_(self.W_q.weight, std=1.0 / d_model)
+
+    def forward(self, x: Tensor, all_prev: list[Tensor]) -> Tensor:
+        # x: (B, T, D) — current block input
+        # all_prev: list of len (layer_idx + 1), each (B, T, D)
+        H = torch.stack(all_prev, dim=2)  # (B, T, n_prior, D)
+        q = self.W_q(x)  # (B, T, K)
+        # Raw dot product — no softmax (per paper ablation)
+        # Scale by 1/sqrt(K) for magnitude control as K grows
+        K = q.size(-1)
+        w = torch.einsum("btk,nk->btn", q, self.keys) * (K ** -0.5)  # (B, T, n_prior)
+        return (w.unsqueeze(-1) * H).sum(dim=2)  # (B, T, D)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1370,6 +1438,7 @@ class GPT(nn.Module):
         diff_attn: bool = False,
         peri_ln: bool = False,
         denseformer: bool = False,
+        mudd_streams: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1415,6 +1484,10 @@ class GPT(nn.Module):
         )
         self.final_norm = RMSNorm()
         self.dwa = DWA(num_layers) if denseformer else None
+        # MUDDFormer: per-stream DA modules. mudd_v always; mudd_q/k if streams >= 3.
+        self.mudd_v = nn.ModuleList([MUDDConnection(model_dim, i) for i in range(num_layers)]) if mudd_streams >= 1 else None
+        self.mudd_q = nn.ModuleList([MUDDConnection(model_dim, i) for i in range(num_layers)]) if mudd_streams >= 3 else None
+        self.mudd_k = nn.ModuleList([MUDDConnection(model_dim, i) for i in range(num_layers)]) if mudd_streams >= 3 else None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -1464,51 +1537,55 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # DenseFormer: replace U-Net skips with DWA cross-layer aggregation.
-        if self.dwa is not None:
-            all_hidden: list[Tensor] = []
-            v_first: Tensor | None = None
-            for i in range(self.num_encoder_layers):
-                if all_hidden:
-                    x = self.dwa(len(all_hidden) - 1, all_hidden)
-                if self.value_residual:
-                    x, v_raw = self.blocks[i](x, x0, v_first)
-                    if i == 0:
-                        v_first = v_raw
-                else:
-                    x = self.blocks[i](x, x0)
-                all_hidden.append(x)
-            for i in range(self.num_decoder_layers):
-                bi = self.num_encoder_layers + i
-                x = self.dwa(len(all_hidden) - 1, all_hidden)
-                if self.value_residual:
-                    x, _ = self.blocks[bi](x, x0, v_first)
-                else:
-                    x = self.blocks[bi](x, x0)
-                all_hidden.append(x)
-            x = self.dwa(len(all_hidden) - 1, all_hidden)  # final DWA before output norm
-        # First half stores skips; second half reuses them in reverse order.
-        elif self.value_residual:
-            # Value Residual: pass first-layer V to all subsequent blocks.
-            # v_first starts as None; set after first block; all blocks get it.
-            v_first: Tensor | None = None
-            for i in range(self.num_encoder_layers):
-                x, v_raw = self.blocks[i](x, x0, v_first)
-                if i == 0:
+        # Unified block loop: DWA (residual stream), MUDD (Q/K/V streams), U-Net skips.
+        # DWA replaces U-Net when enabled. MUDD is orthogonal to both.
+        # Separate hidden-state lists because they have different seeding semantics:
+        #   dwa_hidden: starts empty — DWA skips block 0, weights[i] has (i+1) entries
+        #   mudd_hidden: starts with embedding — MUDD uses embedding as h_0 at block 0
+        dwa_hidden: list[Tensor] = [] if self.dwa is not None else None
+        mudd_hidden: list[Tensor] = [x] if self.mudd_v is not None else None
+        v_first: Tensor | None = None
+
+        for bi in range(len(self.blocks)):
+            dec_i = bi - self.num_encoder_layers  # ≥0 only in decoder half
+
+            # --- Residual stream routing ---
+            if self.dwa is not None:
+                # DWA: skip first block (no prior states yet), then weighted mix.
+                if dwa_hidden:
+                    x = self.dwa(len(dwa_hidden) - 1, dwa_hidden)
+            elif dec_i >= 0 and skips:
+                # Standard U-Net: add matching encoder skip to decoder input.
+                x = x + self.skip_weights[dec_i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+
+            # --- MUDD: per-stream dynamic aggregation for Q/K/V ---
+            if self.mudd_v is not None:
+                q_agg = self.mudd_q[bi](x, mudd_hidden) if self.mudd_q is not None else None
+                k_agg = self.mudd_k[bi](x, mudd_hidden) if self.mudd_k is not None else None
+                v_agg = self.mudd_v[bi](x, mudd_hidden)
+                mudd_qkv: tuple | None = (q_agg, k_agg, v_agg)
+            else:
+                mudd_qkv = None
+
+            # --- Block forward ---
+            if self.value_residual:
+                x, v_raw = self.blocks[bi](x, x0, v_first, mudd_qkv)
+                if bi == 0:
                     v_first = v_raw
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v_first)
-        else:
-            for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0)
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0)
+            else:
+                x = self.blocks[bi](x, x0, None, mudd_qkv)
+
+            # --- Accumulate hidden states and U-Net encoder skips ---
+            if dwa_hidden is not None:
+                dwa_hidden.append(x)
+            if mudd_hidden is not None:
+                mudd_hidden.append(x)
+            if dwa_hidden is None and mudd_hidden is None and dec_i < 0:
+                skips.append(x)  # encoder half: save for U-Net skip
+
+        # Final DWA aggregation before output norm (replaces last block output).
+        if self.dwa is not None and dwa_hidden:
+            x = self.dwa(len(dwa_hidden) - 1, dwa_hidden)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1661,6 +1738,7 @@ def main() -> None:
         diff_attn=args.diff_attn,
         peri_ln=args.peri_ln,
         denseformer=args.denseformer,
+        mudd_streams=args.mudd_streams,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

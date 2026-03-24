@@ -393,6 +393,24 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier10" || "$TARGET" == "V99" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 11 — MUDDFormer: Dynamic Dense Connections (arXiv:2502.12170, ICML 2025)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   V100: MUDD V-stream only (highest per-ablation benefit, ~45K params)
+#   V101: MUDD Q+K+V streams (full 3-stream variant, ~137K params)
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier11" || "$TARGET" == "V100" ]]; then
+  run_rp "V100_mudd_v" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MUDD_STREAMS=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier11" || "$TARGET" == "V101" ]]; then
+  run_rp "V101_mudd_qkv" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MUDD_STREAMS=3"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

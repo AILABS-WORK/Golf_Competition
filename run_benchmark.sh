@@ -20,6 +20,7 @@
 #   bash run_benchmark.sh aggc            # Adaptive Group Gradient Clipping (V97)
 #   bash run_benchmark.sh denseformer     # DenseFormer DWA cross-layer aggregation (V98)
 #   bash run_benchmark.sh numuon          # NuMuon nuclear-norm proximal step (V99)
+#   bash run_benchmark.sh mudd            # MUDDFormer dynamic dense connections (V100-V101)
 #   bash run_benchmark.sh V44             # single variant by ID
 #
 # Output:
@@ -666,6 +667,24 @@ if [[ "$TARGET" == "numuon" || "$TARGET" == "V99" ]]; then
     "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
      GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
      NUMUON_WEIGHT=1e-4"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MUDDFORMER GROUP (V100-V101) — Dynamic Dense Connections arXiv:2502.12170
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "mudd" || "$TARGET" == "V100" ]]; then
+  run_bench "V100_mudd_v" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     MUDD_STREAMS=1"
+fi
+
+if [[ "$TARGET" == "mudd" || "$TARGET" == "V101" ]]; then
+  run_bench "V101_mudd_qkv" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     MUDD_STREAMS=3"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
