@@ -268,6 +268,17 @@ class Hyperparameters:
     if diff_attn:
         mudd_streams = 0  # DiffAttn incompatible: V has 2*head_dim shape
 
+    # Gated Attention (arXiv:2505.06708, NeurIPS 2025 Best Paper, adopted in Qwen3-Next).
+    # Post-SDPA sigmoid gate: y ← y * sigmoid(W_gate @ x) per head per token.
+    # Eliminates attention sinks, introduces query-dependent sparsity (~12% mean gate).
+    # Incompatible with DIFF_TRANSFORMER (handled inside CausalSelfAttention).
+    gated_attn = bool(int(os.environ.get("GATED_ATTN", 0)))
+
+    # Muon-VS: Variance-Adaptive Muon (arXiv:2601.14603).
+    # Tracks variance of gradient deviations from momentum trend → scales update inversely.
+    # M̄_VS = M̃_t / (√Γ̂_t + ε) before Newton-Schulz. Zero new hyperparameters.
+    muon_vs = bool(int(os.environ.get("MUON_VS", 0)))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -292,10 +303,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0, muon_vs: bool = False):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay, muon_vs=muon_vs),
         )
 
     @torch.no_grad()
@@ -321,6 +332,7 @@ class Muon(torch.optim.Optimizer):
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
+            use_muon_vs = group.get("muon_vs", False)
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
@@ -329,9 +341,24 @@ class Muon(torch.optim.Optimizer):
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
+                    # Muon-VS: track variance of (M_{t-1} - G_t) before momentum update.
+                    if use_muon_vs:
+                        if "variance_buffer" not in state:
+                            state["variance_buffer"] = torch.zeros_like(g)
+                            state["step_count"] = 0
+                        state["step_count"] += 1
+                        t = state["step_count"]
+                        var_buf = state["variance_buffer"]
+                        # Γ_t = β*Γ_{t-1} + β*(1-β)*(M_{t-1} - G_t)²
+                        var_buf.mul_(momentum).addcmul_(buf - g, buf - g, value=momentum * (1.0 - momentum))
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    # Muon-VS: scale by inverse sqrt of variance before Newton-Schulz.
+                    if use_muon_vs:
+                        bias_corr = 1.0 - momentum ** t
+                        var_hat = var_buf / bias_corr
+                        g = g / (var_hat.sqrt() + 1e-8)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -1042,6 +1069,7 @@ class CausalSelfAttention(nn.Module):
         rope_dims: int = 0,
         diff_attn: bool = False,
         depth: int = 0,
+        gated_attn: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1084,6 +1112,12 @@ class CausalSelfAttention(nn.Module):
             self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(0, 0.1))
             # Post-norm on the 2*head_dim differential output (before output projection).
             self.subln = RMSNorm()
+        # Gated Attention (arXiv:2505.06708, NeurIPS 2025 Best Paper).
+        # c_gate: dim → num_heads, outputs one gate scalar per head per token.
+        # Applied as y ← y * sigmoid(gate) after SDPA. Incompatible with diff_attn.
+        self.gated_attn = gated_attn and not diff_attn
+        if self.gated_attn:
+            self.c_gate = CastedLinear(dim, num_heads, bias=False)
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Subtract from y the component parallel to v (XSA: arXiv:2501.12588).
@@ -1166,6 +1200,10 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2)  # [B, T, H, D]
+        if self.gated_attn:
+            # Per-head sigmoid gate (arXiv:2505.06708): eliminates attention sinks.
+            gate = self.c_gate(x)  # (B, T, num_heads)
+            y = y * torch.sigmoid(gate).unsqueeze(-1)  # (B, T, H, 1) broadcast
         if self.xsa:
             y = self._xsa_efficient(y, v)
         y = y.contiguous().reshape(bsz, seqlen, dim)
@@ -1226,6 +1264,7 @@ class Block(nn.Module):
         diff_attn: bool = False,
         depth: int = 0,
         peri_ln: bool = False,
+        gated_attn: bool = False,
     ):
         super().__init__()
         norm_cls = SSRMSNorm if ssnorm else RMSNorm
@@ -1243,7 +1282,7 @@ class Block(nn.Module):
         self.ln_scale_factor = ln_scale_factor  # fixed float: 1/sqrt(layer_idx+1)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         value_residual=value_residual, xsa=xsa, rope_dims=rope_dims,
-                                        diff_attn=diff_attn, depth=depth)
+                                        diff_attn=diff_attn, depth=depth, gated_attn=gated_attn)
         self.mlp = MLP(dim, mlp_mult, activation=mlp_activation, leaky_alpha=leaky_relu_alpha)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1506,6 +1545,7 @@ class GPT(nn.Module):
                     diff_attn=diff_attn,
                     depth=i,
                     peri_ln=peri_ln,
+                    gated_attn=gated_attn,
                 )
                 for i in range(num_layers)
             ]
@@ -1806,6 +1846,7 @@ def main() -> None:
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_weight_decay,
+        muon_vs=args.muon_vs,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr

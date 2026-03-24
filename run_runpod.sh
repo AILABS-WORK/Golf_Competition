@@ -423,6 +423,28 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier12" || "$TARGET" == "V102" ]]; the
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 13 — Gated Attention (arXiv:2505.06708, NeurIPS 2025 Best Paper, Qwen3)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   V103: Post-SDPA sigmoid gate — eliminates attention sinks, ~4K extra params.
+#         gate = sigmoid(W_gate @ x) ∈ R^{B,T,H}, applied as y ← y * gate.
+if [[ "$TARGET" == "all" || "$TARGET" == "tier13" || "$TARGET" == "V103" ]]; then
+  run_rp "V103_gated_attn" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT GATED_ATTN=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 14 — Muon-VS: Variance-Adaptive Muon (arXiv:2601.14603)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   V104: Variance scaling before Newton-Schulz. 1.36x faster convergence.
+#         Zero new hyperparameters beyond existing Muon momentum.
+if [[ "$TARGET" == "all" || "$TARGET" == "tier14" || "$TARGET" == "V104" ]]; then
+  run_rp "V104_muon_vs" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MUON_VS=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

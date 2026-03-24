@@ -697,6 +697,24 @@ if [[ "$TARGET" == "lotion" || "$TARGET" == "V102" ]]; then
      LOTION=1 QAT_START_FRACTION=0.0"
 fi
 
+# GATED ATTENTION GROUP (V103) — Post-SDPA sigmoid gate arXiv:2505.06708
+# NeurIPS 2025 Best Paper. Eliminates attention sinks, ~4K extra params.
+if [[ "$TARGET" == "gated_attn" || "$TARGET" == "V103" ]]; then
+  run_bench "V103_gated_attn" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     GATED_ATTN=1"
+fi
+
+# MUON-VS GROUP (V104) — Variance-Adaptive Muon arXiv:2601.14603
+# Zero new hyperparameters. 1.36x convergence speedup over vanilla Muon.
+if [[ "$TARGET" == "muon_vs" || "$TARGET" == "V104" ]]; then
+  run_bench "V104_muon_vs" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd \
+     MUON_VS=1"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY + CHART
 # ═══════════════════════════════════════════════════════════════════════════════

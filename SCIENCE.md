@@ -309,6 +309,21 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 - **Expected gain**: −0.008 to −0.015 BPB
 - **Control var**: `DENSEFORMER=1` → V98 in run_runpod.sh
 
+#### ✅ Gated Attention (arXiv:2505.06708, NeurIPS 2025 Best Paper) **IMPLEMENTED**
+- **What**: Post-SDPA per-head sigmoid gate: `y ← y * σ(W_gate @ x)` where `W_gate ∈ R^{dim × num_heads}`. Only ~4K extra parameters. Adopted in Qwen3-Next production.
+- **Why it works**: Standard softmax always produces a non-zero attention map → the first token accumulates probability (attention sink). Sigmoid gate allows heads to fully suppress their output → genuine sparsity (~12% mean gate activation in the paper). Also introduces non-linearity on the value pathway.
+- **Synergy**: Sparsity makes activation distributions more quantization-friendly. Gate elimination of sinks leaves more model capacity for meaningful attention patterns.
+- **Expected gain**: −0.005 to −0.015 BPB
+- **Incompatibility**: Disabled with DIFF_TRANSFORMER (handled inside CausalSelfAttention).
+- **Control var**: `GATED_ATTN=1` → V103 in run_runpod.sh
+
+#### ✅ Muon-VS — Variance-Adaptive Muon (arXiv:2601.14603) **IMPLEMENTED**
+- **What**: Before Newton-Schulz orthogonalization, divides the Nesterov-extrapolated gradient by `sqrt(Γ̂_t) + ε` where `Γ_t = β*Γ_{t-1} + β*(1-β)*(M_{t-1} - G_t)²`. Tracks variance of gradient deviations from trend. Zero new hyperparameters.
+- **Why it works**: Uniform Muon LR treats all layers identically. Shallow layers (near embedding) have dense, stable gradients; deep layers have sparser signals. Variance scaling suppresses high-noise updates and amplifies low-noise ones. Paper shows 1.36× fewer iterations to same validation loss.
+- **Expected gain**: −0.005 to −0.012 BPB (from 1.36× convergence speedup at fixed 7K steps).
+- **Stacks with**: NorMuon (post-orthogonalization neuron normalization — orthogonal concerns).
+- **Control var**: `MUON_VS=1` → V104 in run_runpod.sh
+
 #### ✅ LOTION — Smooth QAT via Calibrated Noise (arXiv:2510.08757) **IMPLEMENTED**
 - **What**: Replaces STE (biased, no convergence guarantee) with noise injection: `ε ~ N(0, sB²·Δ(1-Δ))` where `Δ = fractional_part(w/sB)`. Noise peaks at bin midpoints (Δ=0.5) and vanishes at grid points (Δ=0,1), creating a smooth "attraction basin" around quantization bins.
 - **Why it works over STE**: STE approximates `∂Q(w)/∂w ≈ 1` — provably biased. LOTION trains on `E[L(w+ε)]` — the smoothed objective has exact gradients. The optimizer naturally drives weights to quantization bins to reduce its own noise variance.
@@ -329,6 +344,8 @@ Post-quant penalty for unquantized V0: +0.2444 BPB (expected — no QAT). Compet
 | WSM Merging | 2507.17634 | A | −0.003/−0.006 | Low | ✅ WSM=1 |
 | MUDDFormer | 2502.12170 | A | −0.015/−0.035 | High | ✅ MUDD_STREAMS=1/3 |
 | NuMuon | 2603.03597 | A | −0.003/−0.008 | Low | ✅ NUMUON_WEIGHT=1e-4 |
+| Gated Attention | 2505.06708 | S | −0.005/−0.015 | Low | ✅ GATED_ATTN=1 |
+| Muon-VS | 2601.14603 | S | −0.005/−0.012 | Low | ✅ MUON_VS=1 |
 | LOTION | 2510.08757 | A | −0.005/−0.015 | Low | ✅ LOTION=1 |
 | MASA | 2508.04581 | B | −0.005/−0.015 | High | todo |
 | AGGC | 2601.11864 | B | −0.001/−0.004 | Low | ✅ AGGC_BETA=0.99 |
