@@ -217,6 +217,13 @@ class Hyperparameters:
     # Builds on existing Muon (which handles 2D weights); SSNorm targets the norm parameters.
     ssnorm = bool(int(os.environ.get("SSNORM", 0)))
 
+    # Differential Transformer (arXiv:2410.05258, ICLR 2025 Oral).
+    # Halves head_dim so each attention head has two sub-heads (Q1/Q2, K1/K2) sharing same V.
+    # Lambda scalar damps noise in attention maps via differential subtraction attn1 - λ·attn2.
+    # Zero parameter overhead — Q/K/V projection shapes are identical to baseline.
+    # Incompatible with XSA (diff V shape) and VALUE_RESIDUAL (shape mismatch at blend).
+    diff_attn = bool(int(os.environ.get("DIFF_TRANSFORMER", 0)))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -967,6 +974,8 @@ class CausalSelfAttention(nn.Module):
         value_residual: bool = False,
         xsa: bool = False,
         rope_dims: int = 0,
+        diff_attn: bool = False,
+        depth: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -975,10 +984,15 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
+        self.diff_attn = diff_attn
+        # Differential Transformer (arXiv:2410.05258, ICLR 2025 Oral):
+        # Halve head_dim so each head contains two sub-heads (Q1/Q2, K1/K2).
+        # Projection shapes are IDENTICAL to baseline — zero parameter overhead.
+        # V is NOT split: both attention maps weight the same 2*head_dim V.
+        self.head_dim = (dim // num_heads // 2) if diff_attn else (dim // num_heads)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
+        kv_dim = self.num_kv_heads * (2 * self.head_dim if diff_attn else self.head_dim)
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
@@ -987,12 +1001,23 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.value_residual = value_residual
-        self.xsa = xsa
+        self.xsa = xsa and not diff_attn  # XSA + DiffAttn not combined (incompatible V shapes)
         self.rope_dims = rope_dims
         # v_alpha: learned scalar blending first-layer V into this layer's V.
         # Initialized to 0 so early training is identical to baseline.
         if value_residual:
             self.v_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # DiffAttn: lambda parameters and post-differential normalization.
+        # lambda_init is depth-dependent (deeper layers start closer to 0.8).
+        # Four head_dim-vectors produce one scalar: lambda = exp(q1·k1) - exp(q2·k2) + lambda_init
+        if diff_attn:
+            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+            self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(0, 0.1))
+            self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(0, 0.1))
+            self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(0, 0.1))
+            self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(0, 0.1))
+            # Post-norm on the 2*head_dim differential output (before output projection).
+            self.subln = RMSNorm()
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Subtract from y the component parallel to v (XSA: arXiv:2501.12588).
@@ -1007,6 +1032,43 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, v_first: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
+        if self.diff_attn:
+            # Differential Transformer (arXiv:2410.05258): two sub-heads per head.
+            # Q/K → reshape to expose sub-head pairs; V is full 2*head_dim (not split).
+            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, 2, self.head_dim)
+            q1 = q[:, :, :, 0, :].transpose(1, 2)   # [B, H, T, head_dim]
+            q2 = q[:, :, :, 1, :].transpose(1, 2)
+            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, 2, self.head_dim)
+            k1 = k[:, :, :, 0, :].transpose(1, 2)   # [B, Hkv, T, head_dim]
+            k2 = k[:, :, :, 1, :].transpose(1, 2)
+            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, 2 * self.head_dim).transpose(1, 2)
+            # QK-norm on each sub-head independently
+            q1 = F.rms_norm(q1, (q1.size(-1),));  q2 = F.rms_norm(q2, (q2.size(-1),))
+            k1 = F.rms_norm(k1, (k1.size(-1),));  k2 = F.rms_norm(k2, (k2.size(-1),))
+            # RoPE on both sub-head pairs
+            cos, sin = self.rotary(seqlen, x.device, q1.dtype)
+            q1 = apply_rotary_emb(q1, cos, sin, self.rope_dims)
+            q2 = apply_rotary_emb(q2, cos, sin, self.rope_dims)
+            k1 = apply_rotary_emb(k1, cos, sin, self.rope_dims)
+            k2 = apply_rotary_emb(k2, cos, sin, self.rope_dims)
+            # q_gain applied to both sub-heads
+            gain = self.q_gain.to(dtype=q1.dtype)[None, :, None, None]
+            q1 = q1 * gain;  q2 = q2 * gain
+            # Two SDPA calls sharing the same V (Ev = 2*head_dim ≠ E = head_dim, valid in PyTorch)
+            use_gqa = self.num_kv_heads != self.num_heads
+            attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, enable_gqa=use_gqa)
+            attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, enable_gqa=use_gqa)
+            # Lambda scalar: depth-dependent init + learned correction via dot-product pairs
+            lam = (
+                torch.exp((self.lambda_q1.float() * self.lambda_k1.float()).sum())
+                - torch.exp((self.lambda_q2.float() * self.lambda_k2.float()).sum())
+                + self.lambda_init
+            )
+            attn = attn1 - lam * attn2              # [B, H, T, 2*head_dim]
+            attn = attn.transpose(1, 2).contiguous() # [B, T, H, 2*head_dim]
+            # SubLN + fixed (1 - lambda_init) scale, as per paper §3.2
+            attn = self.subln(attn) * (1.0 - self.lambda_init)
+            return self.proj(attn.reshape(bsz, seqlen, dim))
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -1086,6 +1148,8 @@ class Block(nn.Module):
         leaky_relu_alpha: float = 0.5,
         hybrid_norm: bool = False,
         ssnorm: bool = False,
+        diff_attn: bool = False,
+        depth: int = 0,
     ):
         super().__init__()
         norm_cls = SSRMSNorm if ssnorm else RMSNorm
@@ -1096,7 +1160,8 @@ class Block(nn.Module):
         self.value_residual = value_residual
         self.ln_scale_factor = ln_scale_factor  # fixed float: 1/sqrt(layer_idx+1)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        value_residual=value_residual, xsa=xsa, rope_dims=rope_dims)
+                                        value_residual=value_residual, xsa=xsa, rope_dims=rope_dims,
+                                        diff_attn=diff_attn, depth=depth)
         self.mlp = MLP(dim, mlp_mult, activation=mlp_activation, leaky_alpha=leaky_relu_alpha)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1230,6 +1295,7 @@ class GPT(nn.Module):
         leaky_relu_alpha: float = 0.5,
         hybrid_norm: bool = False,
         ssnorm: bool = False,
+        diff_attn: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1266,6 +1332,8 @@ class GPT(nn.Module):
                     leaky_relu_alpha=leaky_relu_alpha,
                     hybrid_norm=hybrid_norm,
                     ssnorm=ssnorm,
+                    diff_attn=diff_attn,
+                    depth=i,
                 )
                 for i in range(num_layers)
             ]
@@ -1491,6 +1559,7 @@ def main() -> None:
         leaky_relu_alpha=args.leaky_relu_alpha,
         hybrid_norm=args.hybrid_norm,
         ssnorm=args.ssnorm,
+        diff_attn=args.diff_attn,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

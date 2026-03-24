@@ -10,7 +10,9 @@
 #   bash run_runpod.sh tier1        # 6 highest-priority variants (~1 hr, ~$7)
 #   bash run_runpod.sh tier2        # next 6 variants (~1 hr, ~$7)
 #   bash run_runpod.sh tier3        # sweep remaining variants (~2 hr, ~$14)
-#   bash run_runpod.sh all          # everything (~4 hrs, ~$28)
+#   bash run_runpod.sh tier4        # WSM variants (~1 hr, ~$7)
+#   bash run_runpod.sh tier5        # DiffAttn variants (~1 hr, ~$7)
+#   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
 # Cost: ~$1 per variant on 8×H100 @ $6/hr
@@ -280,6 +282,38 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier4" || "$TARGET" == "V89" ]]; then
      WSM=1 WSM_MERGE_FRACTION=0.3 SWA_INTERVAL=50 \
      MLP_ACTIVATION=leaky_relu2 LEAKY_RELU_ALPHA=0.5 \
      TTT_EPOCHS=10 TTT_LR=0.0001"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 5 — Differential Transformer (arXiv:2410.05258, ICLR 2025 Oral)
+#   Halves head_dim, two sub-heads per head (Q1/Q2, K1/K2) sharing same V.
+#   Lambda scalar: attn = attn1 - λ·attn2 damps attention noise.
+#   Zero parameter overhead — projection shapes identical to baseline.
+#   NOTE: incompatible with VALUE_RESIDUAL (different V shape).
+#   V90: DiffAttn alone (ablation — does the mechanism help at all?)
+#   V91: DiffAttn + full quantized SOTA (main submission candidate)
+#   V92: DiffAttn + HybridNorm + SSNorm + SOTA (maximum stacking)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier5" || "$TARGET" == "V90" ]]; then
+  # DiffAttn alone on SOTA stack: isolates the differential attention mechanism
+  run_rp "V90_diff_attn" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     DIFF_TRANSFORMER=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier5" || "$TARGET" == "V91" ]]; then
+  # DiffAttn + full quantized SOTA (XSA auto-disabled by DiffAttn incompatibility)
+  run_rp "V91_diff_attn_sota" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT DIFF_TRANSFORMER=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier5" || "$TARGET" == "V92" ]]; then
+  # DiffAttn + Layer 9 (HybridNorm + SSNorm) + full SOTA (maximum novel stack)
+  run_rp "V92_diff_layer9_sota" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT DIFF_TRANSFORMER=1 HYBRID_NORM=1 SSNORM=1"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
