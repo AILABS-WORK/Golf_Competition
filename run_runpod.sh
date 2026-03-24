@@ -340,6 +340,26 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier6" || "$TARGET" == "V94" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 7 — Power-law warmdown (arXiv:2602.06797 optimal LR scaling laws)
+#   Linear decay (α=1.0) is the default. For severely undertrained models
+#   (≪Chinchilla optimal), scaling theory predicts steeper decay (α>1) is better.
+#   V95: α=2.0 (quadratic) on full SOTA — tests steeper warmdown shape
+#   V96: α=1.5 (mid-power) on full SOTA — moderate steepening
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier7" || "$TARGET" == "V95" ]]; then
+  run_rp "V95_wsd_power2" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT WSD_POWER=2.0"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier7" || "$TARGET" == "V96" ]]; then
+  run_rp "V96_wsd_power15" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT WSD_POWER=1.5"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

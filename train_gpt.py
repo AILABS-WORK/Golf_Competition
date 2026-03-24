@@ -146,6 +146,13 @@ class Hyperparameters:
     # WSD LR: cosine warmdown schedule instead of default linear.
     wsd_lr = bool(int(os.environ.get("WSD_LR", 0)))
 
+    # WSD Power: power-law warmdown exponent.
+    # 1.0 = linear (default), 2.0 = quadratic (faster early decay, longer tail),
+    # 0.5 = sqrt (slower). Inspired by arXiv:2602.06797 scaling-law optimal decay.
+    # For severely undertrained models (~37× below Chinchilla), exponents 1.5–2.5 are
+    # theoretically optimal. WSD_LR overrides WSD_POWER when both are set.
+    wsd_power = float(os.environ.get("WSD_POWER", 1.0))
+
     # TWEO: colinearity penalty lambda (arXiv:2511.23225). 0 = disabled.
     tweo_lambda = float(os.environ.get("TWEO_LAMBDA", 0.0))
 
@@ -1684,7 +1691,7 @@ def main() -> None:
                 if args.wsd_lr:
                     # WSD: cosine decay (smoother than linear, better final loss)
                     return 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress)))
-                return max(progress, 0.0)
+                return max(progress ** args.wsd_power, 0.0)
             return 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
@@ -1693,7 +1700,7 @@ def main() -> None:
             progress = remaining_ms / max(warmdown_ms, 1e-9)
             if args.wsd_lr:
                 return 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress)))
-            return progress
+            return progress ** args.wsd_power
         return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
