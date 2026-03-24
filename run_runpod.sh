@@ -12,6 +12,7 @@
 #   bash run_runpod.sh tier3        # sweep remaining variants (~2 hr, ~$14)
 #   bash run_runpod.sh tier4        # WSM variants (~1 hr, ~$7)
 #   bash run_runpod.sh tier5        # DiffAttn variants (~1 hr, ~$7)
+#   bash run_runpod.sh tier6        # Peri-LN variants (~30 min, ~$3)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -314,6 +315,28 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier5" || "$TARGET" == "V92" ]]; then
   run_rp "V92_diff_layer9_sota" \
     "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
      $SOTA_QUANT DIFF_TRANSFORMER=1 HYBRID_NORM=1 SSNORM=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 6 — Peri-LN (arXiv:2502.02732, Gemma/OLMo 2 families)
+#   Pre-Norm + Post-Norm on BOTH attention and FFN sublayers.
+#   Superset of HybridNorm (which Post-Norms FFN only). Mutually exclusive.
+#   V93: Peri-LN alone on SOTA stack (ablation vs HybridNorm)
+#   V94: Peri-LN + SSNorm + SOTA (replaces HybridNorm in best layer-9 stack)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier6" || "$TARGET" == "V93" ]]; then
+  # Peri-LN alone on SOTA stack (compare directly to V80_hybridnorm)
+  run_rp "V93_peri_ln" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     PERI_LN=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier6" || "$TARGET" == "V94" ]]; then
+  # Peri-LN + SSNorm + full SOTA (replaces HybridNorm in V83 for direct comparison)
+  run_rp "V94_peri_ln_ssnorm_sota" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT PERI_LN=1 SSNORM=1"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

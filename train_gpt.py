@@ -224,6 +224,14 @@ class Hyperparameters:
     # Incompatible with XSA (diff V shape) and VALUE_RESIDUAL (shape mismatch at blend).
     diff_attn = bool(int(os.environ.get("DIFF_TRANSFORMER", 0)))
 
+    # Peri-LN (arXiv:2502.02732, used in Gemma / OLMo 2 families, ICML 2025).
+    # Wraps BOTH attention and FFN sublayers with Pre-Norm AND Post-Norm.
+    # HybridNorm = Pre-Norm on attn + Post-Norm on FFN (no pre-norm on FFN).
+    # Peri-LN   = Pre-Norm + Post-Norm on BOTH attn and FFN.
+    # Strictly a superset of HybridNorm; mutually exclusive (don't use both).
+    # Post-Norm on attention stabilizes the attention output distribution → better int6 QAT.
+    peri_ln = bool(int(os.environ.get("PERI_LN", 0)))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1150,13 +1158,20 @@ class Block(nn.Module):
         ssnorm: bool = False,
         diff_attn: bool = False,
         depth: int = 0,
+        peri_ln: bool = False,
     ):
         super().__init__()
         norm_cls = SSRMSNorm if ssnorm else RMSNorm
         self.attn_norm = norm_cls()
-        self.mlp_norm = norm_cls() if not hybrid_norm else None  # Pre-Norm for FFN only when not HybridNorm
-        self.mlp_post_norm = norm_cls() if hybrid_norm else None  # Post-Norm for FFN when HybridNorm
+        # mlp_norm: Pre-Norm before FFN. HybridNorm skips it (FFN receives residual directly).
+        # Peri-LN keeps Pre-Norm on both sublayers.
+        self.mlp_norm = norm_cls() if not hybrid_norm else None
+        # Post-Norm on FFN: HybridNorm and Peri-LN both apply it.
+        self.mlp_post_norm = norm_cls() if (hybrid_norm or peri_ln) else None
+        # Post-Norm on attention output: Peri-LN only (HybridNorm leaves attn Pre-Norm only).
+        self.attn_post_norm = norm_cls() if peri_ln else None
         self.hybrid_norm = hybrid_norm
+        self.peri_ln = peri_ln
         self.value_residual = value_residual
         self.ln_scale_factor = ln_scale_factor  # fixed float: 1/sqrt(layer_idx+1)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -1175,19 +1190,26 @@ class Block(nn.Module):
         as_ = self.attn_scale.to(dtype=x.dtype)[None, None, :]
         if self.value_residual:
             attn_out, v_raw = self.attn(self.attn_norm(x) * ln_s, v_first)
+            if self.attn_post_norm is not None:
+                attn_out = self.attn_post_norm(attn_out)
             x = x + as_ * attn_out
-            if self.hybrid_norm:
-                x = x + ms * self.mlp_post_norm(self.mlp(x))
+            if self.hybrid_norm or self.peri_ln:
+                mlp_in = x if self.hybrid_norm else self.mlp_norm(x) * ln_s
+                x = x + ms * self.mlp_post_norm(self.mlp(mlp_in))
             else:
                 x = x + ms * self.mlp(self.mlp_norm(x) * ln_s)
             return x, v_raw
         attn_out = self.attn(self.attn_norm(x) * ln_s)
+        if self.attn_post_norm is not None:
+            # Peri-LN: Post-Norm on attention output (arXiv:2502.02732, Gemma/OLMo 2).
+            # Normalizes the attention sublayer output before adding to residual stream.
+            attn_out = self.attn_post_norm(attn_out)
         x = x + as_ * attn_out
-        if self.hybrid_norm:
-            # HybridNorm: Post-Norm on FFN (norm after the sublayer output).
-            # QK-norm on attention path provides stability; Post-Norm on FFN
-            # provides the quality advantage that Pre-Norm doesn't capture.
-            x = x + ms * self.mlp_post_norm(self.mlp(x))
+        if self.hybrid_norm or self.peri_ln:
+            # HybridNorm: FFN receives residual x directly (no Pre-Norm), then Post-Normed.
+            # Peri-LN: FFN receives Pre-Normed x, then Post-Normed (full wrap).
+            mlp_in = x if self.hybrid_norm else self.mlp_norm(x) * ln_s
+            x = x + ms * self.mlp_post_norm(self.mlp(mlp_in))
         else:
             x = x + ms * self.mlp(self.mlp_norm(x) * ln_s)
         return x
@@ -1296,6 +1318,7 @@ class GPT(nn.Module):
         hybrid_norm: bool = False,
         ssnorm: bool = False,
         diff_attn: bool = False,
+        peri_ln: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1334,6 +1357,7 @@ class GPT(nn.Module):
                     ssnorm=ssnorm,
                     diff_attn=diff_attn,
                     depth=i,
+                    peri_ln=peri_ln,
                 )
                 for i in range(num_layers)
             ]
@@ -1560,6 +1584,7 @@ def main() -> None:
         hybrid_norm=args.hybrid_norm,
         ssnorm=args.ssnorm,
         diff_attn=args.diff_attn,
+        peri_ln=args.peri_ln,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
