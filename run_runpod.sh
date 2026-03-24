@@ -564,6 +564,66 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier16" || "$TARGET" == "V115" ]]; the
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 17 — qTTT-inspired and Architecture Extensions (V116–V120)
+# ═══════════════════════════════════════════════════════════════════════════════
+# New variants from deep paper research (2025–2026):
+#
+#  V116: Q-only LoRA TTT (qTTT-inspired, arXiv:2512.13898)
+#        Update only c_q adapters, not V/K/lm_head. Hypothesis: Q controls
+#        "what to retrieve" without corrupting key/value document encodings.
+#        Expected ~0.52–0.58 BPB (fewer params, cleaner adaptation signal).
+#
+#  V117: Q-only + RELI. RELI gradient init is especially valuable for Q-only
+#        since the gradient SVD directly shows which query directions matter.
+#        Expected ~0.50–0.55 BPB.
+#
+#  V118: Full Chimera + Q-only + RELI + MLP LoRA.
+#        Q-only for attention (cleaner) + MLP LoRA for factual knowledge.
+#        Orthogonal: attention routing (Q) and factual recall (MLP).
+#        Expected ~0.46–0.52 BPB.
+#
+#  V119: RELI (staggered LoRA-GA init) ablation vs V110.
+#        V110 used simple init; V119 uses proven staggered init (LoRA-GA NeurIPS 2024).
+#        Same config as V110 — pure ablation of init quality.
+#        Expected improvement: +1–3% faster convergence per chunk.
+#
+#  V120: Kitchen sink V2 — Chimera + MLP LoRA + RELI (staggered) + Difficulty + Q-not-only.
+#        Keeps V/K LoRA but adds all research-validated improvements.
+#        Expected ~0.44–0.50 BPB.
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V116" ]]; then
+  run_rp "V116_q_only_lora" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MLP_ACTIVATION=leaky_relu2 \
+     TTT_LORA=1 TTT_EPOCHS=50 TTT_LR=3e-4 TTT_LORA_RANK_QV=8 \
+     TTT_MIN_NLL=1 TTT_TEMPERATURE=0.98 TTT_Q_ONLY=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V117" ]]; then
+  run_rp "V117_q_only_reli" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MLP_ACTIVATION=leaky_relu2 \
+     TTT_LORA=1 TTT_EPOCHS=50 TTT_LR=3e-4 TTT_LORA_RANK_QV=8 \
+     TTT_MIN_NLL=1 TTT_TEMPERATURE=0.98 TTT_Q_ONLY=1 TTT_RELI=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V118" ]]; then
+  run_rp "V118_q_only_reli_mlp" \
+    "$CHIMERA_BASE TTT_Q_ONLY=1 TTT_RELI=1 TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V119" ]]; then
+  # RELI with staggered LoRA-GA init (ablation vs V110 which had simple init)
+  run_rp "V119_reli_staggered_ablation" \
+    "$CHIMERA_BASE TTT_RELI=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V120" ]]; then
+  run_rp "V120_kitchen_sink_v2" \
+    "$CHIMERA_BASE TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 TTT_RELI=1 TTT_DIFFICULTY=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

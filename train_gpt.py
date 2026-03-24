@@ -242,6 +242,10 @@ class Hyperparameters:
     ttt_lora_decay = float(os.environ.get("TTT_LORA_DECAY", 0.0))     # soft-reset decay (0=hard reset)
     ttt_difficulty = bool(int(os.environ.get("TTT_DIFFICULTY", 0)))   # difficulty-adaptive epochs
     ttt_reli = bool(int(os.environ.get("TTT_RELI", 0)))               # RELI grad-aligned LoRA init
+    # Q-only LoRA TTT (qTTT-inspired, arXiv:2512.13898): adapt only W_Q, not V/K.
+    # Hypothesis: Q controls "what to look for" without corrupting the key/value representations
+    # that encode document meaning. Cleaner signal, fewer params, more stable adaptation.
+    ttt_q_only = bool(int(os.environ.get("TTT_Q_ONLY", 0)))
 
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
@@ -768,21 +772,25 @@ def _eval_val_lora_ttt(
     rank_chunk_end = (total_chunks * (rank + 1)) // world_size
 
     # Collect LoRA targets: (module_name, module, lora_rank, lr_multiplier)
+    # Q-only mode (TTT_Q_ONLY): adapt only c_q, inspired by qTTT (arXiv:2512.13898).
+    # Rationale: Q controls "what to retrieve" without corrupting key/value document encodings.
     lora_targets: list[tuple[str, CastedLinear, int, float]] = []
     for name, mod in raw_model.named_modules():
         if not isinstance(mod, CastedLinear):
             continue
         tail = name.rsplit(".", 1)[-1]
-        if tail in ("c_q", "c_v"):
+        if tail == "c_q":
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 1.0))
-        elif tail == "c_k" and args.ttt_k_lora:
+        elif tail == "c_v" and not args.ttt_q_only:
+            lora_targets.append((name, mod, args.ttt_lora_rank_qv, 1.0))
+        elif tail == "c_k" and args.ttt_k_lora and not args.ttt_q_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 0.3))
-        elif name == "lm_head":
+        elif name == "lm_head" and not args.ttt_q_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_lmhead, 1.0))
-        elif args.ttt_mlp_lora and tail == "fc":
+        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "fc":
             # MLP fc: 0.5× LR — factual knowledge retrieval side
             lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 0.5))
-        elif args.ttt_mlp_lora and tail == "proj" and ".mlp." in name:
+        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "proj" and ".mlp." in name:
             # MLP proj: 3× LR — output projection benefits from higher LR
             lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 3.0))
 
@@ -882,13 +890,15 @@ def _eval_val_lora_ttt(
                         # SVD: g ≈ U S Vh; top-r rows of Vh = principal input directions
                         try:
                             U, S, Vh = torch.linalg.svd(g, full_matrices=False)
+                            # LoRA-GA staggered init: A gets top-r right-singular vectors (Vh[:r])
+                            # B gets rows r+1 to 2r of U (NOT 0:r). This ensures A and B span
+                            # different subspaces → richer gradient approximation in B@A product.
+                            # Validated: 2-4× convergence speedup vs random init (LoRA-GA NeurIPS 2024).
                             scale = 0.01 / (S[0].item() + 1e-8)
+                            r2 = min(2 * r, U.shape[1])  # guard for small matrices
+                            b_cols = U[:, r:r2] if r2 > r else U[:, :r]  # staggered
                             mod._lora_A = (Vh[:r] * scale).detach().requires_grad_(True)
-                            mod._lora_B = (U[:, :r] * (S[:r] * scale).unsqueeze(0)).detach().requires_grad_(True)
-                            # Update param_group to point to new tensors
-                            for pg in param_groups:
-                                if id(pg.get("params", [None])[0]) in (id(mod._lora_A), id(mod._lora_B)):
-                                    pg["params"] = [mod._lora_A, mod._lora_B]
+                            mod._lora_B = (b_cols * (S[r:r2] * scale if r2 > r else S[:r] * scale).unsqueeze(0)).detach().requires_grad_(True)
                         except Exception:
                             pass  # fall back to random init if SVD fails
             # Rebuild param_groups with updated tensor references
