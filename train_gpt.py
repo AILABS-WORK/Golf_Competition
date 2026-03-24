@@ -345,6 +345,12 @@ class Hyperparameters:
     #   Strictly better than post-hoc Fisher; zero extra FLOPs (reads existing Adam state).
     #   Requires ttt_ewc_lambda > 0 to be active (uses same EWC penalty infrastructure).
     ttt_ewc_path_integral = bool(int(os.environ.get("TTT_EWC_PATH_INTEGRAL", 0)))
+    # V157: Sequential gate schedule (arXiv:2505.06708, NeurIPS 2025 Best Paper).
+    #   Q-LoRA adapts "what to attend to"; gate adapts "whether the head fires at all".
+    #   Competing from epoch 0 creates interference. Fix: run Q-LoRA alone for the first
+    #   ttt_gate_delay fraction of epochs, then activate gates for the remaining epochs.
+    #   E.g., 0.75 = gates activate at 75% of inner loop. 0=off (gates from epoch 0).
+    ttt_gate_delay = float(os.environ.get("TTT_GATE_DELAY", 0.0))    # 0=off, 0.75=75%
 
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
@@ -1036,10 +1042,12 @@ def _eval_val_lora_ttt(
             else:
                 param_groups.append({"params": [A, B], "lr": base_lr * lr_mult * _rs, "_lr_mult": lr_mult * _rs})
 
-        # Gate parameters get a very small LR (0.05×) — scale is sensitive
+        # Gate parameters get a very small LR (0.05×) — scale is sensitive.
+        # V157: sequential gate schedule — start with lr=0, activate at ttt_gate_delay fraction.
         if gate_targets:
             gate_params = [gp for _, gp, _ in gate_targets]
-            param_groups.append({"params": gate_params, "lr": base_lr * 0.05, "_lr_mult": 0.05})
+            _gate_lr0 = 0.0 if args.ttt_gate_delay > 0.0 else base_lr * 0.05
+            param_groups.append({"params": gate_params, "lr": _gate_lr0, "_lr_mult": 0.05, "_is_gate": True})
 
         # RELI: Retroactive Gradient-Aligned LoRA Init
         # Run one backward pass, SVD the gradient to get principal directions, re-init A/B
@@ -1129,6 +1137,10 @@ def _eval_val_lora_ttt(
             t_inner = epoch / max(n_epochs - 1, 1)
             lr_scale = 0.5 * (1.0 + math.cos(math.pi * t_inner))
             for pg in ttt_opt.param_groups:
+                # V157: sequential gate schedule — keep gate lr=0 until delay threshold
+                if pg.get("_is_gate", False) and args.ttt_gate_delay > 0.0:
+                    if epoch < int(n_epochs * args.ttt_gate_delay):
+                        continue  # leave gate lr at 0; Q-LoRA adapts alone first
                 pg["lr"] = base_lr * pg["_lr_mult"] * lr_scale
 
             # V133 RELI-RA: at epoch n//3, SVD-compress 2r → r and rebuild optimizer.

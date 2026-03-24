@@ -17,6 +17,7 @@
 #   bash run_runpod.sh tier20       # Tier 20: norm-bound/KD/label-smooth/chunk2k (~1 hr, ~$8)
 #   bash run_runpod.sh tier21       # Tier 21: top-N layers + MLP-only TTT (~1 hr, ~$6)
 #   bash run_runpod.sh tier22       # Tier 22: Muon optimizer for LoRA adapters (~1 hr, ~$5)
+#   bash run_runpod.sh tier23       # Tier 23: XSA-aligned TTT + sequential gate (~1 hr, ~$6)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -955,6 +956,52 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V151" ]]; the
      TTT_TOP_LAYERS=3 \
      TTT_RELI=1 TTT_RS_LORA=1 TTT_LORA_PLUS=1 \
      TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 23: XSA-aligned TTT + sequential gate (V156–V160)
+# Research: "Attention Sinks Induce Gradient Sinks" (arXiv:2603.17771),
+#   Gated Attention NeurIPS 2025 Best Paper (arXiv:2505.06708),
+#   Active-Dormant Heads (arXiv:2410.13835).
+# Expected: -0.01–0.04 BPB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier23" || "$TARGET" == "V156" ]]; then
+  # XSA-aligned Q-LoRA: restrict to top-4 layers = XSA layers (CHIMERA_BASE XSA_LAST_N=4).
+  # Non-XSA layers' Q gradients are corrupted by attention sink pollution (arXiv:2603.17771).
+  # XSA Jacobian (I - v_i v_i^T/||v||²) filters sink noise → cleaner Q updates.
+  run_rp "V156_xsa_top4" \
+    "$CHIMERA_BASE TTT_TOP_LAYERS=4"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier23" || "$TARGET" == "V157" ]]; then
+  # Sequential gate schedule: Q-LoRA alone for first 75% of epochs, then Q+gate.
+  # Avoids gate/Q interference. Gate = "whether head fires"; Q = "what to attend to".
+  run_rp "V157_seq_gate" \
+    "$CHIMERA_BASE TTT_GATE_ADAPT=1 TTT_GATE_DELAY=0.75"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier23" || "$TARGET" == "V158" ]]; then
+  # XSA-aligned + MLP-only: Q-free, restrict to XSA layers, adapt only MLP there.
+  run_rp "V158_xsa_mlp" \
+    "$CHIMERA_BASE TTT_MLP_ONLY=1 TTT_LORA_RANK_MLP=8 TTT_TOP_LAYERS=4"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier23" || "$TARGET" == "V159" ]]; then
+  # XSA top-4 + RELI + sequential gate compound.
+  run_rp "V159_xsa_reli_gate" \
+    "$CHIMERA_BASE TTT_TOP_LAYERS=4 TTT_RELI=1 TTT_GATE_ADAPT=1 TTT_GATE_DELAY=0.75"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier23" || "$TARGET" == "V160" ]]; then
+  # Grand compound: top-4 XSA Q + sequential gate + PI-EWC + Muon + norm bound + KD.
+  run_rp "V160_grand_compound" \
+    "$CHIMERA_BASE \
+     TTT_TOP_LAYERS=4 \
+     TTT_GATE_ADAPT=1 TTT_GATE_DELAY=0.75 \
+     TTT_RELI=1 TTT_RS_LORA=1 TTT_LORA_PLUS=1 \
+     TTT_EWC_LAMBDA=0.05 TTT_EWC_PATH_INTEGRAL=1 \
+     TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
