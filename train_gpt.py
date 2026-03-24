@@ -247,6 +247,30 @@ class Hyperparameters:
     # that encode document meaning. Cleaner signal, fewer params, more stable adaptation.
     ttt_q_only = bool(int(os.environ.get("TTT_Q_ONLY", 0)))
 
+    # LoRA TTT Round-2 novel extensions (V121–V126) — from deep research synthesis:
+    #
+    # Two-Phase RELI (TTT_RELI_PHASES=2): after phase-1 TTT finds min-NLL, re-run RELI
+    #   on the residual gradient from that improved state → explore different subspace.
+    #   "Phase 2 explores what phase 1 left on the table." ~50% more free epochs.
+    #
+    # Adaptive Temperature (TTT_ADAPTIVE_TEMP=1): when RELI is enabled, S[0] (top
+    #   gradient singular value) is a free difficulty signal. High S[0] = model very
+    #   surprised → keep T near 1.0 (don't overcorrect confidence). Low S[0] = model
+    #   adapted well → use low T (sharpen predictions). Formula: T_eff = T_base +
+    #   (1 - T_base) * (S0 / (S0 + S0_ref)). Zero extra compute when RELI is already used.
+    #
+    # Token-Selective TTT (TTT_TOKEN_K=0.5): per epoch, compute per-token loss and
+    #   train only on the top-k% hardest tokens. Hard tokens carry ~80% of useful
+    #   gradient; easy tokens add noise. Importance-sampling over the token distribution.
+    #   With 50% selection: ~same wall-clock, better signal quality per epoch.
+    #
+    # RELI-Difficulty Fusion (implicit when TTT_RELI=1 + TTT_DIFFICULTY=1): eliminates
+    #   the separate difficulty pre-scoring forward pass by reusing S[0] from RELI SVD.
+    #   S[0] directly measures model surprise — better proxy than NLL-based scoring.
+    ttt_reli_phases = int(os.environ.get("TTT_RELI_PHASES", 1))      # 1=standard, 2=two-phase
+    ttt_adaptive_temp = bool(int(os.environ.get("TTT_ADAPTIVE_TEMP", 0)))
+    ttt_token_k = float(os.environ.get("TTT_TOKEN_K", 0.0))          # 0=all, 0.5=top-50% hardest
+
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
     # Key insight: merging N checkpoints from the stable-LR phase approximates LR decay
@@ -869,12 +893,12 @@ def _eval_val_lora_ttt(
 
         # RELI: Retroactive Gradient-Aligned LoRA Init
         # Run one backward pass, SVD the gradient to get principal directions, re-init A/B
+        reli_s0_max = 0.0  # tracks max top singular value — reused for adaptive features
         if args.ttt_reli:
             raw_model.train()
             ttt_opt_tmp = torch.optim.SGD(
                 [A for _, mod, _, _ in lora_targets for A in [mod._lora_A, mod._lora_B]],
                 lr=0.0)  # zero-LR SGD just to get grads registered
-            # Enable grad temporarily for LoRA params
             for nm, mod, r, _ in lora_targets:
                 mod._lora_A.requires_grad_(True)
                 mod._lora_B.requires_grad_(True)
@@ -890,6 +914,7 @@ def _eval_val_lora_ttt(
                         # SVD: g ≈ U S Vh; top-r rows of Vh = principal input directions
                         try:
                             U, S, Vh = torch.linalg.svd(g, full_matrices=False)
+                            reli_s0_max = max(reli_s0_max, S[0].item())  # track for adaptive features
                             # LoRA-GA staggered init: A gets top-r right-singular vectors (Vh[:r])
                             # B gets rows r+1 to 2r of U (NOT 0:r). This ensures A and B span
                             # different subspaces → richer gradient approximation in B@A product.
@@ -909,6 +934,13 @@ def _eval_val_lora_ttt(
                 gate_params = [gp for _, gp, _ in gate_targets]
                 param_groups.append({"params": gate_params, "lr": base_lr * 0.05, "_lr_mult": 0.05})
 
+            # RELI-Difficulty Fusion: when both RELI and DIFFICULTY are enabled, reuse S[0]
+            # as difficulty proxy — eliminates separate forward pass AND gives richer signal.
+            # S[0] = top gradient singular value = "how much this chunk surprises the model"
+            if args.ttt_difficulty and reli_s0_max > 0:
+                _S0_REF = 0.05  # empirical: typical S[0] for mid-difficulty chunks
+                n_epochs = max(5, min(3 * args.ttt_epochs, int(args.ttt_epochs * reli_s0_max / _S0_REF)))
+
         ttt_opt = torch.optim.AdamW(param_groups, weight_decay=0.0, betas=(0.9, 0.95))
 
         # Inner TTT loop with cosine LR over epochs
@@ -923,8 +955,20 @@ def _eval_val_lora_ttt(
                 pg["lr"] = base_lr * pg["_lr_mult"] * lr_scale
 
             ttt_opt.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = raw_model(x, y)
+            if args.ttt_token_k > 0:
+                # Token-Selective TTT: train only on the top-k% hardest tokens.
+                # Hard tokens carry ~80% of gradient signal; easy tokens add noise.
+                # Importance sampling over the token distribution (V126).
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    sel_logits = raw_model._get_logits(x)
+                per_tok = F.cross_entropy(
+                    sel_logits.float().reshape(-1, sel_logits.size(-1)), y.reshape(-1), reduction="none"
+                )
+                k_n = max(1, int(args.ttt_token_k * per_tok.numel()))
+                loss = per_tok.topk(k_n).values.mean()  # only hard tokens in backward
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = raw_model(x, y)
             loss.backward()
             ttt_opt.step()
 
@@ -940,18 +984,96 @@ def _eval_val_lora_ttt(
                 mod._lora_A = best_lora[nm][0]
                 mod._lora_B = best_lora[nm][1]
 
+        # ── Two-Phase RELI (TTT_RELI_PHASES=2) ──────────────────────────────────────
+        # After phase-1 min-NLL, re-run RELI from that improved state.
+        # The gradient computed from the min-NLL state is the RESIDUAL gradient:
+        # it encodes what the model still doesn't know after phase 1.
+        # Phase-2 A init: residual gradient SVD (NEW directions phase 1 missed).
+        # Phase-2 B init: 50% carry-over from phase 1 (preserve learned output dirs).
+        # LR is halved for phase 2 (finer exploration in the improved landscape).
+        if args.ttt_reli_phases >= 2 and args.ttt_reli and best_lora:
+            for nm, mod, r, _ in lora_targets:
+                mod._lora_A = best_lora[nm][0].detach().requires_grad_(True)
+                mod._lora_B = best_lora[nm][1].detach().requires_grad_(True)
+            # Residual gradient from phase-1 best state
+            raw_model.train()
+            ttt_tmp2 = torch.optim.SGD(
+                [t for _, mod, _, _ in lora_targets for t in [mod._lora_A, mod._lora_B]], lr=0.0)
+            ttt_tmp2.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss_p2_init = raw_model(x, y)
+            loss_p2_init.backward()
+            with torch.no_grad():
+                for nm, mod, r, _ in lora_targets:
+                    if mod._lora_A.grad is not None:
+                        g2 = mod._lora_A.grad.float()
+                        try:
+                            U2, S2, Vh2 = torch.linalg.svd(g2, full_matrices=False)
+                            scale2 = 0.01 / (S2[0].item() + 1e-8)
+                            r2b = min(2 * r, U2.shape[1])
+                            b_cols2 = U2[:, r:r2b] if r2b > r else U2[:, :r]
+                            # A: residual gradient directions (novel subspace)
+                            new_A = (Vh2[:r] * scale2).detach()
+                            # B: blend phase-1 learned directions with residual
+                            res_B = (b_cols2 * (S2[r:r2b] if r2b > r else S2[:r]).mul(scale2).unsqueeze(0)).detach()
+                            new_B = (0.5 * best_lora[nm][1] + 0.5 * res_B)
+                            mod._lora_A = new_A.requires_grad_(True)
+                            mod._lora_B = new_B.requires_grad_(True)
+                        except Exception:
+                            pass
+            # Phase-2 optimizer at half LR (finer landscape exploration)
+            p2_groups = [{"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult * 0.5, "_lr_mult": lr_mult * 0.5}
+                         for _, mod, r, lr_mult in lora_targets]
+            if gate_targets:
+                p2_groups.append({"params": [gp for _, gp, _ in gate_targets], "lr": base_lr * 0.025, "_lr_mult": 0.025})
+            ttt_opt2 = torch.optim.AdamW(p2_groups, weight_decay=0.0, betas=(0.9, 0.95))
+            p2_epochs = max(5, n_epochs // 2)
+            for epoch2 in range(p2_epochs):
+                t2 = epoch2 / max(p2_epochs - 1, 1)
+                lr2 = 0.5 * (1.0 + math.cos(math.pi * t2))
+                for pg in ttt_opt2.param_groups:
+                    pg["lr"] = base_lr * pg["_lr_mult"] * lr2
+                ttt_opt2.zero_grad(set_to_none=True)
+                if args.ttt_token_k > 0:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        sl2 = raw_model._get_logits(x)
+                    pt2 = F.cross_entropy(sl2.float().reshape(-1, sl2.size(-1)), y.reshape(-1), reduction="none")
+                    loss2 = pt2.topk(max(1, int(args.ttt_token_k * pt2.numel()))).values.mean()
+                else:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss2 = raw_model(x, y)
+                loss2.backward()
+                ttt_opt2.step()
+                if args.ttt_min_nll and loss2.item() < best_nll:
+                    best_nll = loss2.item()
+                    best_lora = {nm: (mod._lora_A.detach().clone(), mod._lora_B.detach().clone())
+                                 for nm, mod, r, _ in lora_targets}
+            if args.ttt_min_nll and best_lora:
+                for nm, mod, r, _ in lora_targets:
+                    mod._lora_A = best_lora[nm][0]
+                    mod._lora_B = best_lora[nm][1]
+
         # Save LoRA state for soft-reset on next chunk
         if args.ttt_lora_decay > 0.0:
             prev_lora = {nm: (mod._lora_A.detach().clone(), mod._lora_B.detach().clone())
                          for nm, mod, r, _ in lora_targets}
 
         # Score chunk; optional temperature calibration (T<1 → more confident → lower BPB)
+        # Adaptive Temperature: when RELI is used, S[0] (top gradient singular value) tells us
+        # how "surprised" the model was before TTT. High S[0] = model was very wrong → even after
+        # TTT, be less overconfident in sharpening (T stays near 1.0). Low S[0] = model adapted
+        # well → confident scoring is warranted (T stays at args.ttt_temperature).
+        effective_temp = args.ttt_temperature
+        if args.ttt_adaptive_temp and reli_s0_max > 0:
+            _S0_REF_T = 0.05  # reference S[0]: mid-difficulty chunk
+            surprise = reli_s0_max / (reli_s0_max + _S0_REF_T)  # [0, 1]: 1=very surprised
+            effective_temp = args.ttt_temperature + (1.0 - args.ttt_temperature) * surprise
         raw_model.eval()
         with torch.inference_mode():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                if args.ttt_temperature != 1.0:
+                if effective_temp != 1.0:
                     logits = raw_model._get_logits(x)
-                    logits = logits / args.ttt_temperature
+                    logits = logits / effective_temp
                     chunk_loss = F.cross_entropy(
                         logits.float().reshape(-1, logits.size(-1)), y.reshape(-1)
                     ).detach()

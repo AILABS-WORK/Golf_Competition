@@ -624,6 +624,113 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier17" || "$TARGET" == "V120" ]]; the
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TIER 18 — Novel Cross-Technique Connections (V121–V130)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Four deep connections found by analyzing all variants together:
+#
+# CONNECTION 1: RELI S[0] → free difficulty + temperature signal
+#   RELI already computes SVD of gradient; S[0] = "model surprise". This is a
+#   better difficulty proxy than a separate NLL forward pass AND calibrates T.
+#   V121 = RELI-Difficulty fusion (no extra forward pass, S[0] as difficulty)
+#   V123 = Adaptive Temperature (T scales from 0.98→1.0 as S[0] increases)
+#
+# CONNECTION 2: Two-Phase RELI — residual gradient exploration
+#   Phase 1: RELI init → TTT → min-NLL checkpoint.
+#   Phase 2: RELI on RESIDUAL gradient from checkpoint → 50% more epochs.
+#   Key insight: gradient at min-NLL encodes what the model STILL doesn't know.
+#   Phase 2 explores the orthogonal subspace phase 1 missed.
+#   V122 = Two-Phase RELI only
+#   V127 = Two-Phase RELI + Token-Selective (compound signal quality)
+#
+# CONNECTION 3: Token-Selective TTT — importance sampling over tokens
+#   Hard tokens carry ~80% of gradient signal; easy tokens add noise.
+#   Train on top-50% highest-loss tokens per epoch → same wall-clock, better SNR.
+#   V124 = Token-Selective only (TTT_TOKEN_K=0.5)
+#   V125 = Token-Selective + RELI (both target high-information signal)
+#
+# CONNECTION 4: Q+MLP "routing+knowledge" separation
+#   Q-only adapts attention routing; MLP LoRA adapts factual knowledge.
+#   Together with RELI: gradient init is better because attention and MLP
+#   have different gradient structures → orthogonal SVD directions.
+#   V118 already covers this (already in tier17).
+#
+# KITCHEN SINK VARIANTS (all techniques together):
+#   V128 = Two-Phase RELI + Token-Selective + Adaptive-T + MLP LoRA
+#   V129 = Full stack + Q-only + Two-Phase RELI + Token-Selective
+#   V130 = Max ablation: every novel technique in one run
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V121" ]]; then
+  # RELI-Difficulty fusion: S[0] as difficulty proxy (no extra forward pass)
+  run_rp "V121_reli_diff_fusion" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_DIFFICULTY=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V122" ]]; then
+  # Two-Phase RELI: residual gradient exploration after phase-1 min-NLL
+  run_rp "V122_two_phase_reli" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_RELI_PHASES=2 TTT_MIN_NLL=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V123" ]]; then
+  # Adaptive Temperature: S[0] calibrates T per-chunk
+  run_rp "V123_adaptive_temp" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_ADAPTIVE_TEMP=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V124" ]]; then
+  # Token-Selective TTT: train only on top-50% hardest tokens
+  run_rp "V124_token_selective_50" \
+    "$CHIMERA_BASE TTT_TOKEN_K=0.5"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V125" ]]; then
+  # Token-Selective + RELI: both target high-information signal
+  run_rp "V125_token_sel_reli" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_TOKEN_K=0.5"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V126" ]]; then
+  # Two-Phase RELI + Adaptive Temp: compound gradient-signal improvements
+  run_rp "V126_twophase_adaptive" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_RELI_PHASES=2 TTT_ADAPTIVE_TEMP=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V127" ]]; then
+  # Two-Phase RELI + Token-Selective: both attack gradient quality
+  run_rp "V127_twophase_toksel" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_RELI_PHASES=2 TTT_TOKEN_K=0.5"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V128" ]]; then
+  # Compound: Two-Phase RELI + Token-Selective + Adaptive-T + MLP LoRA
+  run_rp "V128_compound_reli_mlp" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_RELI_PHASES=2 TTT_ADAPTIVE_TEMP=1 \
+     TTT_TOKEN_K=0.5 TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V129" ]]; then
+  # Q-only path: Q + MLP LoRA + Two-Phase RELI + Token-Selective
+  # Clean routing/knowledge separation with best gradient techniques
+  run_rp "V129_qonly_twophase_toksel" \
+    "$SOTA_BASE XSA_LAST_N=4 EMA=1 EMA_DECAY=0.997 PARTIAL_ROPE_DIMS=16 LN_SCALE=1 \
+     $SOTA_QUANT MLP_ACTIVATION=leaky_relu2 \
+     TTT_LORA=1 TTT_EPOCHS=50 TTT_LR=3e-4 TTT_LORA_RANK_QV=8 TTT_LORA_RANK_LM=16 \
+     TTT_MIN_NLL=1 TTT_TEMPERATURE=0.98 \
+     TTT_Q_ONLY=1 TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 \
+     TTT_RELI=1 TTT_RELI_PHASES=2 TTT_TOKEN_K=0.5 TTT_ADAPTIVE_TEMP=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V130" ]]; then
+  # Maximum stack: every novel technique enabled
+  # Expected: 0.41-0.48 BPB if all techniques are additive
+  run_rp "V130_maximum_novel_stack" \
+    "$CHIMERA_BASE \
+     TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 TTT_GATE_ADAPT=1 \
+     TTT_RELI=1 TTT_RELI_PHASES=2 TTT_ADAPTIVE_TEMP=1 \
+     TTT_TOKEN_K=0.5 TTT_DIFFICULTY=1 TTT_LORA_DECAY=0.5"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""

@@ -579,6 +579,123 @@ These extensions attack four independent bottlenecks in the PR #611 baseline:
 
 *Current leaderboard 1st place: ~0.5601 BPB (PR #611 Chimera). All V108+ variants expected to beat this.*
 
+---
+
+## LAYER 11 — Novel Cross-Technique Connections (V121–V130)
+
+*Discovered by analyzing all existing variants for deep structural patterns. These aren't independent techniques — they're bridges between what we already built.*
+
+---
+
+### The 4 Connection Clusters
+
+#### Cluster A: RELI's S[0] is a free "surprise signal"
+
+RELI already computes SVD of the gradient per-chunk. The top singular value S[0] measures the **largest directional gradient** — how surprised the model is by this chunk. This same number can drive two other features at zero extra cost:
+
+**V121 — RELI-Difficulty Fusion**: When both `TTT_RELI=1` and `TTT_DIFFICULTY=1` are enabled, skip the separate difficulty pre-scoring forward pass and reuse S[0] directly. `n_epochs ∝ S[0] / S0_ref`. Better signal than NLL (NLL conflates hard-topic chunks with noisy/OOD chunks; S[0] specifically measures directional model uncertainty).
+
+**V123 — Adaptive Temperature**: `T_eff = T_base + (1 - T_base) * (S[0] / (S[0] + S0_ref))`. When the model is very surprised (high S[0]), T moves toward 1.0 — don't sharpen overconfident predictions on chunks where the model clearly struggled. When the model adapted well (low S[0]), T stays at the sharp 0.98. This is per-chunk calibration, not a fixed hyperparameter.
+
+The key insight: **one gradient operation drives three features** (RELI init + difficulty scaling + temperature calibration). No extra wall-clock cost.
+
+---
+
+#### Cluster B: Two-Phase RELI — the "residual gradient" principle
+
+Current RELI runs at the start of each chunk from zero init. But the most informative gradient isn't at zero — it's **at the min-NLL checkpoint from phase 1**:
+
+- Phase 1 gradient = "what the randomly-initialized model needs to learn"
+- Phase 2 gradient = "what the model STILL doesn't know after adapting"
+
+The phase 2 gradient encodes residual uncertainty in an orthogonal subspace to phase 1. By re-running RELI from the phase-1 min-NLL state:
+- `A_phase2` gets the top-r right-singular vectors of the **residual** gradient (new directions)
+- `B_phase2` gets 50% phase-1 B (preserve learned outputs) + 50% residual B (new outputs)
+- Phase 2 uses half LR (finer exploration in the improved landscape)
+- Phase 2 gets `n_epochs // 2` additional epochs
+
+**This is analogous to "gradient orthogonalization" in continual learning** — each phase explores a genuinely different subspace of the weight space, avoiding redundant gradient descent steps.
+
+**V122**: Two-Phase RELI only — pure test of the residual gradient principle
+**V127**: Two-Phase RELI + Token-Selective — both attack gradient quality
+
+Expected: V122 ~0.47–0.52 BPB, V127 ~0.45–0.50 BPB
+
+---
+
+#### Cluster C: Token-Selective TTT — importance sampling over tokens
+
+Current TTT computes cross-entropy over ALL tokens in a chunk. But the gradient quality varies enormously:
+- **Hard tokens** (high per-token loss): gradient is large, well-conditioned, high-information
+- **Easy tokens** (low per-token loss): gradient is tiny, near-zero signal, may even add noise
+
+`TTT_TOKEN_K=0.5` selects the top-50% highest-loss tokens per epoch. The backward pass naturally zeros out easy token contributions. This is **importance sampling** — allocating gradient compute to where it matters most.
+
+Connection to RELI: RELI uses the gradient to find principal directions; token-selective TTT ensures those gradients are high-quality (from hard tokens). Combined, RELI initializes in the right direction AND each training epoch focuses on the most informative tokens.
+
+**Analogy**: This mirrors "curriculum learning in reverse" — instead of easy→hard, we do hard-only. Applied at inference time (per-chunk TTT), this is well-motivated since each chunk has a fixed token budget.
+
+**V124**: Token-Selective only (isolate the effect)
+**V125**: Token-Selective + RELI (high-information gradient direction + high-information signal)
+Expected: V124 ~0.50–0.55 BPB, V125 ~0.47–0.52 BPB
+
+---
+
+#### Cluster D: Q+MLP routing/knowledge separation
+
+This connection was implicit in V118 but deserves explicit framing:
+
+The transformer has two orthogonal adaption channels:
+1. **Attention routing** (Q matrices): "Given this document, which tokens should attend to which?" — what to retrieve
+2. **Factual knowledge** (MLP matrices): "Given this document's topic, which facts are relevant?" — what to know
+
+When we do `TTT_Q_ONLY=1 + TTT_MLP_LORA=1`: we're adapting ONLY these two channels while freezing K and V (the document's encoded representations). K and V define "what the document says"; Q and MLP define "how the model processes it". This separation is:
+- Cleaner gradient signal (no circular adaptation where Q changes affect K/V which affect Q)
+- Fewer total parameters (no K, V, or lm_head adapters)
+- Each channel's RELI init is more meaningful (attention gradient vs MLP gradient are structurally different)
+
+**V129**: Q-only + MLP LoRA + Two-Phase RELI + Token-Selective — the cleanest possible TTT stack. Expected ~0.43–0.49 BPB.
+
+---
+
+### Connection Matrix (new variants)
+
+| Variant | Key connection | Techniques | Expected BPB |
+|---------|---------------|-----------|-------------|
+| V121 | RELI S[0] → difficulty | RELI + DIFFICULTY (fused) | ~0.47–0.53 |
+| V122 | Residual gradient | Two-Phase RELI | ~0.47–0.52 |
+| V123 | RELI S[0] → temperature | RELI + AdaptiveTemp | ~0.49–0.54 |
+| V124 | Importance sampling | Token-Selective 50% | ~0.50–0.55 |
+| V125 | Signal quality compound | Token-Selective + RELI | ~0.47–0.52 |
+| V126 | Gradient quality stack | Two-Phase + AdaptiveTemp | ~0.46–0.51 |
+| V127 | Gradient quality stack | Two-Phase + Token-Selective | ~0.44–0.50 |
+| V128 | All gradient techniques | Two-Phase + TokSel + AdaptiveT + MLP | ~0.42–0.49 |
+| V129 | Clean separation stack | Q-only + MLP + Two-Phase + TokSel | ~0.42–0.48 |
+| V130 | Maximum novel stack | Everything enabled | ~0.41–0.48 |
+
+*The variants that share a cluster are expected to be additive because they attack different aspects of the same bottleneck.*
+
+---
+
+### Why V130 Could Break 0.44 BPB
+
+V130 stacks 7 independent improvements on top of Chimera's 0.56 BPB:
+
+| Technique | Mechanism | Est. individual gain |
+|-----------|-----------|---------------------|
+| Chimera baseline | K-LoRA + min-NLL + T=0.98 | 0.56 (reference) |
+| MLP LoRA | Factual knowledge adaptation | −0.05 |
+| Gate Adaptation | Layer depth routing | −0.03 |
+| RELI (staggered) | Gradient-aligned init | −0.04 |
+| Two-Phase RELI | Residual gradient exploration | −0.03 |
+| Adaptive Temperature | Per-chunk T calibration | −0.01 |
+| Token-Selective | High-SNR gradient signal | −0.03 |
+| Difficulty (RELI-fused) | Compute reallocation | −0.02 |
+| Soft-Reset | Cross-chunk memory | −0.02 |
+
+Conservative stack (0.5× discount for overlapping mechanisms): 0.56 − (0.23 × 0.5) ≈ **0.445 BPB**
+Optimistic (0.7× additive): 0.56 − (0.23 × 0.7) ≈ **0.399 BPB**
+
 ## EXTRAPOLATION METHODOLOGY
 
 ### Token counts (corrected)
