@@ -16,6 +16,7 @@
 #   bash run_runpod.sh tier19       # Tier 19: rsLoRA/LoRA+/EWC/RELI-RA/LayerLR (~1 hr, ~$7)
 #   bash run_runpod.sh tier20       # Tier 20: norm-bound/KD/label-smooth/chunk2k (~1 hr, ~$8)
 #   bash run_runpod.sh tier21       # Tier 21: top-N layers + MLP-only TTT (~1 hr, ~$6)
+#   bash run_runpod.sh tier22       # Tier 22: Muon optimizer for LoRA adapters (~1 hr, ~$5)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -953,6 +954,38 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V151" ]]; the
      TTT_MLP_ONLY=1 TTT_PROJ_ONLY_MLP=1 TTT_LORA_RANK_QV=8 \
      TTT_TOP_LAYERS=3 \
      TTT_RELI=1 TTT_RS_LORA=1 TTT_LORA_PLUS=1 \
+     TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 22: Muon optimizer for LoRA adapters (V152–V154)
+# Research: arXiv:2507.12142 (LoRA meets Riemannian), arXiv:2602.06385 (equal spectral growth)
+# Base model trained with Muon — AdamW creates geometric mismatch for adapters.
+# Expected: -0.002 to -0.006 BPB via rank collapse prevention
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V152" ]]; then
+  # Muon for LoRA A+B adapters — Newton-Schulz orthogonalization, no DDP all-reduce.
+  # Equal singular-value growth prevents rank collapse in multi-step TTT.
+  run_rp "V152_muon_lora" \
+    "$CHIMERA_BASE TTT_MUON=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V153" ]]; then
+  # Muon + RELI: RELI aligns init to gradient principal dirs; Muon keeps them orthogonal.
+  run_rp "V153_muon_reli" \
+    "$CHIMERA_BASE TTT_MUON=1 TTT_RELI=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V154" ]]; then
+  # Max Tier 22: Muon + top-3 MLP-only + RELI + rsLoRA + norm bound + KD.
+  # Full research-validated stack: geometry + layer targeting + convergence + anti-forgetting.
+  run_rp "V154_max_tier22" \
+    "$CHIMERA_BASE \
+     TTT_MUON=1 \
+     TTT_MLP_ONLY=1 TTT_PROJ_ONLY_MLP=1 TTT_LORA_RANK_QV=8 \
+     TTT_TOP_LAYERS=3 \
+     TTT_RELI=1 TTT_RS_LORA=1 \
      TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
 fi
 

@@ -332,6 +332,12 @@ class Hyperparameters:
     #   Attention-only LoRA underperforms MLP-only by 5-15% at any rank.
     #   Mutually exclusive with TTT_Q_ONLY — MLP-only supersedes attention targeting.
     ttt_mlp_only = bool(int(os.environ.get("TTT_MLP_ONLY", 0)))  # skip all attention LoRA
+    # V152: Muon optimizer for LoRA adapters (arXiv:2507.12142 + arXiv:2602.06385).
+    #   Base model was trained with Muon — AdamW for adapters creates geometric mismatch.
+    #   Newton-Schulz orthogonalization → equal singular-value growth → no rank collapse.
+    #   Non-distributed: each GPU processes its own chunks independently.
+    #   Momentum buffers reset per-chunk (chunk context changes completely each time).
+    ttt_muon = bool(int(os.environ.get("TTT_MUON", 0)))  # Muon for LoRA A+B adapters
 
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
@@ -494,8 +500,39 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+def muon_ttt_update(
+    param_groups: list[dict],
+    bufs: dict[int, "Tensor"],
+    ns_steps: int = 5,
+    momentum: float = 0.95,
+) -> None:
+    """Non-distributed Muon step for TTT LoRA adapters (V152).
+    Mirrors the base-training Muon geometry without DDP all-reduce.
+    2D tensors (LoRA A/B) get Newton-Schulz orthogonalization → equal singular-value growth
+    (arXiv:2602.06385). 1D tensors (gates) use plain Nesterov SGD.
+    Each call honours per-group LR from param_groups (rsLoRA + LoRA+ scale already baked in).
+    """
+    with torch.no_grad():
+        for group in param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.float()
+                pid = id(p)
+                if pid not in bufs:
+                    bufs[pid] = torch.zeros_like(g)
+                buf = bufs[pid]
+                buf.mul_(momentum).add_(g)
+                g_upd = g.add(buf, alpha=momentum)   # Nesterov lookahead
+                if g_upd.ndim == 2:
+                    g_upd = zeropower_via_newtonschulz5(g_upd, steps=ns_steps)
+                    g_upd.mul_(max(1, g_upd.size(0) / g_upd.size(1)) ** 0.5)
+                p.sub_(g_upd, alpha=lr)
+
+
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -932,6 +969,8 @@ def _eval_val_lora_ttt(
     # V132: Fisher Memory EWC — cross-chunk regularization using prev Adam 2nd moment
     ewc_fisher:      dict[str, tuple[Tensor, Tensor]] = {}  # Fisher approx per target
     ewc_anchor_ewc:  dict[str, tuple[Tensor, Tensor]] = {}  # LoRA values to anchor toward
+    # V152: Muon momentum buffers (keyed by tensor id, reset each chunk)
+    _muon_bufs: dict[int, Tensor] = {}
 
     for chunk_idx in range(rank_chunk_start, rank_chunk_end):
         chunk_start = chunk_idx * chunk_size
@@ -1071,6 +1110,10 @@ def _eval_val_lora_ttt(
         best_nll = float("inf")
         best_lora: dict[str, tuple[Tensor, Tensor]] = {}
         _reli_ra_pruned = False  # track whether rank-annealing prune has fired
+        # V152: reset Muon buffers per-chunk (new A/B tensors → stale ids invalid;
+        # each document is independent so cross-chunk momentum would add noise)
+        if args.ttt_muon:
+            _muon_bufs.clear()
 
         for epoch in range(n_epochs):
             t_inner = epoch / max(n_epochs - 1, 1)
@@ -1104,6 +1147,8 @@ def _eval_val_lora_ttt(
                     _ra_groups.append({"params": [gp for _, gp, _ in gate_targets], "lr": base_lr * 0.05 * lr_scale, "_lr_mult": 0.05})
                 ttt_opt = torch.optim.AdamW(_ra_groups, weight_decay=0.0, betas=(0.9, 0.95))
                 _reli_ra_pruned = True
+                if args.ttt_muon:
+                    _muon_bufs.clear()  # tensor ids changed after rank prune
 
             ttt_opt.zero_grad(set_to_none=True)
             if args.ttt_token_k > 0:
@@ -1161,7 +1206,12 @@ def _eval_val_lora_ttt(
                 ) * (_T_kd ** 2)
                 loss = loss + args.ttt_kd_alpha * kd_loss
             loss.backward()
-            ttt_opt.step()
+            # V152: Muon step for 2D LoRA params; AdamW for 1D gates (if present).
+            # muon_ttt_update honours per-group LR, no DDP all-reduce.
+            if args.ttt_muon:
+                muon_ttt_update(ttt_opt.param_groups, _muon_bufs)
+            else:
+                ttt_opt.step()
             # V139: LoRA norm bounding (Mu & Klabjan 2024) — clamp after each step.
             # Recovers O(1/T) convergence: unbounded growth → O(1/log T) rate degradation.
             if args.ttt_norm_budget > 0.0:
