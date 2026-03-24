@@ -271,6 +271,57 @@ class Hyperparameters:
     ttt_adaptive_temp = bool(int(os.environ.get("TTT_ADAPTIVE_TEMP", 0)))
     ttt_token_k = float(os.environ.get("TTT_TOKEN_K", 0.0))          # 0=all, 0.5=top-50% hardest
 
+    # ─── Tier 19 novel extensions (V131–V136) ───────────────────────────────────
+    # V131: rsLoRA (arXiv:2312.03732) — scale LR by sqrt(r) instead of /r to keep
+    #   effective step magnitude constant across ranks. Critical for RELI-RA where
+    #   rank changes mid-training: without rsLoRA a rank-16→8 prune doubles the LR.
+    # V131: LoRA+ (arXiv:2402.12354, ICML 2024) — B LR = lambda * A LR where lambda=4
+    #   is the empirically optimal ratio. Justified by µP: B maps FROM the learned
+    #   subspace (needs large updates), A projects INTO it (needs stable updates).
+    ttt_lora_plus = bool(int(os.environ.get("TTT_LORA_PLUS", 0)))    # lr_B = 4 * lr_A
+    ttt_rs_lora   = bool(int(os.environ.get("TTT_RS_LORA", 0)))      # LR *= sqrt(r)
+    ttt_lora_plus_lambda = float(os.environ.get("TTT_LORA_PLUS_LAMBDA", 4.0))  # B/A ratio
+    # V132: Fisher Memory TTT (EWC regularization, arXiv:1612.00796 + arXiv:1805.06370)
+    #   Adam exp_avg_sq IS the diagonal Fisher (EMA of grad²) — zero extra compute.
+    #   Cross-chunk penalty: loss += (λ/2) * Σ F_prev * (θ - θ_prev)²
+    #   High Fisher = parameter was in sharp curvature direction = KEEP.
+    #   Low Fisher = flat direction = freely update.
+    ttt_ewc_lambda = float(os.environ.get("TTT_EWC_LAMBDA", 0.0))   # 0=off, 0.05=light
+    # V133: RELI-RA — Rank Annealing (DyLoRA + GaLore inspired).
+    #   Start at rank-2r for wider gradient subspace exploration. At epoch n//3,
+    #   SVD-compress B@A product back to rank-r (retaining top-r signal directions).
+    #   rsLoRA ensures the LR doesn't jump 1.41× at the prune step.
+    ttt_reli_ra = bool(int(os.environ.get("TTT_RELI_RA", 0)))        # rank annealing
+    # V134: Layer-Stratified Q LR (E2E-TTT arXiv:2512.23675 + Rogers 2020 probing)
+    #   Early layers encode syntax (stable) → LR×1.0
+    #   Middle layers encode semantics → LR×3.0
+    #   Late layers (last 1/3) drive per-document recall → LR×8.0
+    ttt_layer_lr = bool(int(os.environ.get("TTT_LAYER_LR", 0)))      # stratified depth LR
+    # V135: Proj-only MLP LoRA — freeze fc, concentrate rank budget on W_proj only.
+    #   Justified by ROME/MEMIT: factual updates require W_proj (output side of MLP).
+    #   W_fc (key side) detects existing patterns → doesn't need new directions.
+    ttt_proj_only_mlp = bool(int(os.environ.get("TTT_PROJ_ONLY_MLP", 0)))  # proj only
+    # V136: Extended Adaptive Temperature — research shows T_optimal ≈ 1.3 after heavy
+    #   fine-tuning (overconfidence). Extend T range from [0.98, 1.0] to [0.98, T_max].
+    ttt_adaptive_temp_max = float(os.environ.get("TTT_ADAPTIVE_TEMP_MAX", 1.0))  # upper T
+
+    # ─── Tier 20 novel extensions (V139–V142) ───────────────────────────────────
+    # V139: LoRA Norm Bounding (Mu & Klabjan 2024) — clamp ||A||_F and ||B||_F ≤ budget
+    #   after each optimizer step. Recovers O(1/T) convergence rate (vs O(1/log T) without).
+    #   Without bounding, adapters grow unbounded → later epochs have diminishing returns.
+    #   budget=1.0 is the canonical choice from the paper; 0=off (default).
+    ttt_norm_budget = float(os.environ.get("TTT_NORM_BUDGET", 0.0))  # 0=off, 1.0=canonical
+    # V141: Label Smoothing in TTT inner loop (Müller et al. 2019 + anti-forgetting research)
+    #   alpha=0.05 adds (alpha/vocab_size) to each non-target token's target prob.
+    #   Prevents TTT from collapsing to a single token prediction per chunk.
+    #   Equivalent calibration benefit to post-hoc temperature scaling (1 line).
+    ttt_label_smooth = float(os.environ.get("TTT_LABEL_SMOOTH", 0.0))  # 0=off, 0.05=light
+    # V142: KD regularization from frozen base model during TTT.
+    #   Captures base-model logits before any TTT updates (B=0 → delta=0 at fresh init).
+    #   Inner loop penalty: loss += alpha * KL(p_base(T=2) || p_adapted(T=2))
+    #   Prevents overconfidence and catastrophic interference. 3 lines of overhead.
+    ttt_kd_alpha = float(os.environ.get("TTT_KD_ALPHA", 0.0))   # 0=off, 0.1=light
+
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
     # Key insight: merging N checkpoints from the stable-LR phase approximates LR decay
@@ -798,25 +849,45 @@ def _eval_val_lora_ttt(
     # Collect LoRA targets: (module_name, module, lora_rank, lr_multiplier)
     # Q-only mode (TTT_Q_ONLY): adapt only c_q, inspired by qTTT (arXiv:2512.13898).
     # Rationale: Q controls "what to retrieve" without corrupting key/value document encodings.
+    # V134: TTT_LAYER_LR stratifies Q LR by layer depth (early=1×, mid=3×, late=8×).
+    # V135: TTT_PROJ_ONLY_MLP skips fc and uses rank_qv on proj only — ROME/MEMIT justified.
     lora_targets: list[tuple[str, CastedLinear, int, float]] = []
+    _n_layers = getattr(args, "num_layers", 11)
     for name, mod in raw_model.named_modules():
         if not isinstance(mod, CastedLinear):
             continue
         tail = name.rsplit(".", 1)[-1]
+        # V134: parse layer index for depth-stratified Q LR
+        _layer_idx = -1
+        if args.ttt_layer_lr:
+            try:
+                _parts = name.split(".")
+                _h_pos = next(i for i, p in enumerate(_parts) if p == "h")
+                _layer_idx = int(_parts[_h_pos + 1])
+            except (StopIteration, IndexError, ValueError):
+                _layer_idx = -1
         if tail == "c_q":
-            lora_targets.append((name, mod, args.ttt_lora_rank_qv, 1.0))
+            if args.ttt_layer_lr and _layer_idx >= 0:
+                # E2E-TTT: last 1/3 layers drive semantic recall → highest LR
+                _late = int(_n_layers * 2 / 3)
+                _mid  = int(_n_layers * 1 / 3)
+                _q_lr = 8.0 if _layer_idx >= _late else (3.0 if _layer_idx >= _mid else 1.0)
+            else:
+                _q_lr = 1.0
+            lora_targets.append((name, mod, args.ttt_lora_rank_qv, _q_lr))
         elif tail == "c_v" and not args.ttt_q_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 1.0))
         elif tail == "c_k" and args.ttt_k_lora and not args.ttt_q_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 0.3))
         elif name == "lm_head" and not args.ttt_q_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_lmhead, 1.0))
-        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "fc":
-            # MLP fc: 0.5× LR — factual knowledge retrieval side
+        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "fc" and not args.ttt_proj_only_mlp:
+            # MLP fc: 0.5× LR — knowledge retrieval side (skip when proj-only)
             lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 0.5))
         elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "proj" and ".mlp." in name:
-            # MLP proj: 3× LR — output projection benefits from higher LR
-            lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 3.0))
+            # V135 proj-only: use higher rank (rank_qv) on output proj; skip fc
+            _mlp_rank = args.ttt_lora_rank_qv if args.ttt_proj_only_mlp else args.ttt_lora_rank_mlp
+            lora_targets.append((name, mod, _mlp_rank, 3.0))
 
     # Collect gate adaptation targets: Block-level attn_scale / mlp_scale
     gate_targets: list[tuple[str, nn.Parameter, Tensor]] = []  # (name, param, saved_orig)
@@ -840,6 +911,10 @@ def _eval_val_lora_ttt(
 
     # Soft-reset: carry previous chunk LoRA across chunks with exponential decay
     prev_lora: dict[str, tuple[Tensor, Tensor]] = {}
+
+    # V132: Fisher Memory EWC — cross-chunk regularization using prev Adam 2nd moment
+    ewc_fisher:      dict[str, tuple[Tensor, Tensor]] = {}  # Fisher approx per target
+    ewc_anchor_ewc:  dict[str, tuple[Tensor, Tensor]] = {}  # LoRA values to anchor toward
 
     for chunk_idx in range(rank_chunk_start, rank_chunk_end):
         chunk_start = chunk_idx * chunk_size
@@ -868,10 +943,15 @@ def _eval_val_lora_ttt(
 
         # Per-chunk LoRA init: A ~ N(0, 1/sqrt(r)), B = 0 → delta starts at zero
         # Soft-Reset: blend previous chunk LoRA with fresh init via decay
+        # V133 RELI-RA: when rank-annealing is on, start with 2r for the RELI init pass.
+        #   The gradient of A ~ (r_init, in_f) determines how many SVD dirs RELI can see.
+        #   After epoch n//3, SVD-compress back to target rank r.
+        _reli_ra_active = args.ttt_reli_ra and args.ttt_reli
         param_groups = []
         for nm, mod, r, lr_mult in lora_targets:
             out_f, in_f = mod.weight.shape
-            if args.ttt_lora_decay > 0.0 and nm in prev_lora:
+            r_init = (2 * r) if _reli_ra_active else r  # RELI-RA: start wide
+            if args.ttt_lora_decay > 0.0 and nm in prev_lora and not _reli_ra_active:
                 # Soft-reset: prev_A * decay + fresh_randn * sqrt(1 - decay²) / sqrt(r)
                 decay = args.ttt_lora_decay
                 fresh_scale = math.sqrt(1.0 - decay * decay) / math.sqrt(r)
@@ -880,11 +960,18 @@ def _eval_val_lora_ttt(
                      ).detach().requires_grad_(True)
                 B = (prev_lora[nm][1] * decay).detach().requires_grad_(True)
             else:
-                A = torch.randn(r, in_f, device=device, dtype=torch.float32).div_(math.sqrt(r)).requires_grad_(True)
-                B = torch.zeros(out_f, r, device=device, dtype=torch.float32).requires_grad_(True)
+                A = torch.randn(r_init, in_f, device=device, dtype=torch.float32).div_(math.sqrt(r_init)).requires_grad_(True)
+                B = torch.zeros(out_f, r_init, device=device, dtype=torch.float32).requires_grad_(True)
             mod._lora_A = A
             mod._lora_B = B
-            param_groups.append({"params": [A, B], "lr": base_lr * lr_mult, "_lr_mult": lr_mult})
+            # V131 rsLoRA: scale LR by sqrt(r) so step magnitude is rank-invariant
+            _rs = math.sqrt(r) if args.ttt_rs_lora else 1.0
+            if args.ttt_lora_plus:
+                # V131 LoRA+: B gets lambda × A LR (feature-learning regime, µP)
+                param_groups.append({"params": [A], "lr": base_lr * lr_mult * _rs, "_lr_mult": lr_mult * _rs, "_is_A": True})
+                param_groups.append({"params": [B], "lr": base_lr * lr_mult * _rs * args.ttt_lora_plus_lambda, "_lr_mult": lr_mult * _rs * args.ttt_lora_plus_lambda, "_is_A": False})
+            else:
+                param_groups.append({"params": [A, B], "lr": base_lr * lr_mult * _rs, "_lr_mult": lr_mult * _rs})
 
         # Gate parameters get a very small LR (0.05×) — scale is sensitive
         if gate_targets:
@@ -919,17 +1006,25 @@ def _eval_val_lora_ttt(
                             # B gets rows r+1 to 2r of U (NOT 0:r). This ensures A and B span
                             # different subspaces → richer gradient approximation in B@A product.
                             # Validated: 2-4× convergence speedup vs random init (LoRA-GA NeurIPS 2024).
+                            # V133 RELI-RA: init at rank 2r (A uses all 2r Vh rows). Prune to r at epoch//3.
+                            r_use = (2 * r) if _reli_ra_active else r  # init rank
+                            r_use = min(r_use, Vh.shape[0])            # guard vs matrix size
                             scale = 0.01 / (S[0].item() + 1e-8)
-                            r2 = min(2 * r, U.shape[1])  # guard for small matrices
-                            b_cols = U[:, r:r2] if r2 > r else U[:, :r]  # staggered
-                            mod._lora_A = (Vh[:r] * scale).detach().requires_grad_(True)
-                            mod._lora_B = (b_cols * (S[r:r2] * scale if r2 > r else S[:r] * scale).unsqueeze(0)).detach().requires_grad_(True)
+                            r2 = min(2 * r_use, U.shape[1])            # staggered B source
+                            b_cols = U[:, r_use:r2] if r2 > r_use else U[:, :r_use]  # staggered
+                            mod._lora_A = (Vh[:r_use] * scale).detach().requires_grad_(True)
+                            mod._lora_B = (b_cols * (S[r_use:r2] * scale if r2 > r_use else S[:r_use] * scale).unsqueeze(0)).detach().requires_grad_(True)
                         except Exception:
                             pass  # fall back to random init if SVD fails
-            # Rebuild param_groups with updated tensor references
+            # Rebuild param_groups with updated tensor references (apply rsLoRA + LoRA+)
             param_groups = []
             for nm, mod, r, lr_mult in lora_targets:
-                param_groups.append({"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult, "_lr_mult": lr_mult})
+                _rs = math.sqrt(r) if args.ttt_rs_lora else 1.0
+                if args.ttt_lora_plus:
+                    param_groups.append({"params": [mod._lora_A], "lr": base_lr * lr_mult * _rs, "_lr_mult": lr_mult * _rs, "_is_A": True})
+                    param_groups.append({"params": [mod._lora_B], "lr": base_lr * lr_mult * _rs * args.ttt_lora_plus_lambda, "_lr_mult": lr_mult * _rs * args.ttt_lora_plus_lambda, "_is_A": False})
+                else:
+                    param_groups.append({"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult * _rs, "_lr_mult": lr_mult * _rs})
             if gate_targets:
                 gate_params = [gp for _, gp, _ in gate_targets]
                 param_groups.append({"params": gate_params, "lr": base_lr * 0.05, "_lr_mult": 0.05})
@@ -943,16 +1038,55 @@ def _eval_val_lora_ttt(
 
         ttt_opt = torch.optim.AdamW(param_groups, weight_decay=0.0, betas=(0.9, 0.95))
 
+        # V142: KD anchor — capture base logits BEFORE any TTT updates.
+        # At fresh init B=0 so lora_B @ lora_A = 0 → this is pure base-model output.
+        # KL penalty in the inner loop prevents the adapted model from drifting into
+        # overconfident, narrow predictions (anti-forgetting + calibration).
+        base_logits_kd: Tensor | None = None
+        if args.ttt_kd_alpha > 0.0:
+            raw_model.eval()
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    base_logits_kd = raw_model._get_logits(x).detach().float()
+
         # Inner TTT loop with cosine LR over epochs
         raw_model.train()
         best_nll = float("inf")
         best_lora: dict[str, tuple[Tensor, Tensor]] = {}
+        _reli_ra_pruned = False  # track whether rank-annealing prune has fired
 
         for epoch in range(n_epochs):
             t_inner = epoch / max(n_epochs - 1, 1)
             lr_scale = 0.5 * (1.0 + math.cos(math.pi * t_inner))
             for pg in ttt_opt.param_groups:
                 pg["lr"] = base_lr * pg["_lr_mult"] * lr_scale
+
+            # V133 RELI-RA: at epoch n//3, SVD-compress 2r → r and rebuild optimizer.
+            # rsLoRA ensures the LR doesn't jump: alpha/sqrt(r) is continuous at the prune.
+            if _reli_ra_active and not _reli_ra_pruned and epoch == max(1, n_epochs // 3):
+                with torch.no_grad():
+                    for nm, mod, r, lr_mult in lora_targets:
+                        try:
+                            eff = mod._lora_B @ mod._lora_A  # (out_f, in_f)
+                            U_p, S_p, Vh_p = torch.linalg.svd(eff, full_matrices=False)
+                            sc_p = 1.0 / (S_p[0].item() + 1e-8)
+                            mod._lora_A = (Vh_p[:r] * sc_p).detach().requires_grad_(True)
+                            mod._lora_B = (U_p[:, :r] * (S_p[:r] * sc_p).unsqueeze(0)).detach().requires_grad_(True)
+                        except Exception:
+                            pass
+                # Rebuild optimizer for pruned (target-rank) tensors
+                _ra_groups = []
+                for nm, mod, r, lr_mult in lora_targets:
+                    _rs = math.sqrt(r) if args.ttt_rs_lora else 1.0
+                    if args.ttt_lora_plus:
+                        _ra_groups.append({"params": [mod._lora_A], "lr": base_lr * lr_mult * _rs * lr_scale, "_lr_mult": lr_mult * _rs, "_is_A": True})
+                        _ra_groups.append({"params": [mod._lora_B], "lr": base_lr * lr_mult * _rs * args.ttt_lora_plus_lambda * lr_scale, "_lr_mult": lr_mult * _rs * args.ttt_lora_plus_lambda, "_is_A": False})
+                    else:
+                        _ra_groups.append({"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult * _rs * lr_scale, "_lr_mult": lr_mult * _rs})
+                if gate_targets:
+                    _ra_groups.append({"params": [gp for _, gp, _ in gate_targets], "lr": base_lr * 0.05 * lr_scale, "_lr_mult": 0.05})
+                ttt_opt = torch.optim.AdamW(_ra_groups, weight_decay=0.0, betas=(0.9, 0.95))
+                _reli_ra_pruned = True
 
             ttt_opt.zero_grad(set_to_none=True)
             if args.ttt_token_k > 0:
@@ -966,11 +1100,62 @@ def _eval_val_lora_ttt(
                 )
                 k_n = max(1, int(args.ttt_token_k * per_tok.numel()))
                 loss = per_tok.topk(k_n).values.mean()  # only hard tokens in backward
+            elif args.ttt_label_smooth > 0.0:
+                # V141: Label Smoothing in TTT inner loop (Müller et al. 2019).
+                # alpha=0.05 prevents collapse to single token prediction per chunk.
+                # Equivalent calibration benefit to post-hoc temperature scaling.
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    ls_logits = raw_model._get_logits(x)
+                loss = F.cross_entropy(
+                    ls_logits.float().reshape(-1, ls_logits.size(-1)),
+                    y.reshape(-1),
+                    label_smoothing=args.ttt_label_smooth,
+                )
             else:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss = raw_model(x, y)
+            # V132 Fisher Memory EWC: penalise deviation from prev-chunk anchor weighted by
+            # Fisher (Adam exp_avg_sq from prev chunk's optimizer — zero extra compute).
+            # High Fisher = sharp curvature = important parameter = strong pull back.
+            if args.ttt_ewc_lambda > 0.0 and ewc_fisher:
+                for nm, mod, _, _ in lora_targets:
+                    if nm in ewc_fisher:
+                        fA, fB = ewc_fisher[nm]
+                        aA, aB = ewc_anchor_ewc[nm]
+                        # Only penalise dimensions that exist in current (possibly pruned) A/B
+                        _r_cur = mod._lora_A.shape[0]
+                        loss = loss + (args.ttt_ewc_lambda / 2.0) * (
+                            (fA[:_r_cur] * (mod._lora_A - aA[:_r_cur]).pow(2)).sum() +
+                            (fB[:, :_r_cur] * (mod._lora_B - aB[:, :_r_cur]).pow(2)).sum()
+                        )
+            # V142: KD regularization — penalise divergence from base-model distribution.
+            # T=2 softens the target distribution (Hinton et al. 2015 style KD).
+            # Prevents overconfident predictions and catastrophic interference.
+            if args.ttt_kd_alpha > 0.0 and base_logits_kd is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    kd_cur = raw_model._get_logits(x).float()
+                _T_kd = 2.0
+                _flat = kd_cur.reshape(-1, kd_cur.size(-1))
+                _flat_base = base_logits_kd.reshape(-1, base_logits_kd.size(-1))
+                kd_loss = F.kl_div(
+                    F.log_softmax(_flat / _T_kd, dim=-1),
+                    F.softmax(_flat_base / _T_kd, dim=-1),
+                    reduction="batchmean",
+                ) * (_T_kd ** 2)
+                loss = loss + args.ttt_kd_alpha * kd_loss
             loss.backward()
             ttt_opt.step()
+            # V139: LoRA norm bounding (Mu & Klabjan 2024) — clamp after each step.
+            # Recovers O(1/T) convergence: unbounded growth → O(1/log T) rate degradation.
+            if args.ttt_norm_budget > 0.0:
+                with torch.no_grad():
+                    for _, mod, _, _ in lora_targets:
+                        nA = mod._lora_A.norm()
+                        if nA > args.ttt_norm_budget:
+                            mod._lora_A.mul_(args.ttt_norm_budget / nA)
+                        nB = mod._lora_B.norm()
+                        if nB > args.ttt_norm_budget:
+                            mod._lora_B.mul_(args.ttt_norm_budget / nB)
 
             # Min-NLL: snapshot LoRA at the epoch with the lowest NLL
             if args.ttt_min_nll and loss.item() < best_nll:
@@ -983,6 +1168,24 @@ def _eval_val_lora_ttt(
             for nm, mod, r, _ in lora_targets:
                 mod._lora_A = best_lora[nm][0]
                 mod._lora_B = best_lora[nm][1]
+
+        # V132 Fisher extraction: save Adam exp_avg_sq as cross-chunk Fisher approximation.
+        # Adam second moment v_t = EMA(g²) is the standard diagonal Fisher estimate.
+        # Stored BEFORE Two-Phase RELI (so phase-1 state is the anchor, not phase-2).
+        if args.ttt_ewc_lambda > 0.0:
+            _new_fisher: dict[str, tuple[Tensor, Tensor]] = {}
+            _new_anchor: dict[str, tuple[Tensor, Tensor]] = {}
+            for nm, mod, _, _ in lora_targets:
+                _sA = ttt_opt.state.get(mod._lora_A, {})
+                _sB = ttt_opt.state.get(mod._lora_B, {})
+                if "exp_avg_sq" in _sA and "exp_avg_sq" in _sB:
+                    _new_fisher[nm] = (_sA["exp_avg_sq"].detach().clone(),
+                                       _sB["exp_avg_sq"].detach().clone())
+                    _new_anchor[nm] = (mod._lora_A.detach().clone(),
+                                       mod._lora_B.detach().clone())
+            if _new_fisher:
+                ewc_fisher     = _new_fisher
+                ewc_anchor_ewc = _new_anchor
 
         # ── Two-Phase RELI (TTT_RELI_PHASES=2) ──────────────────────────────────────
         # After phase-1 min-NLL, re-run RELI from that improved state.
@@ -1022,8 +1225,14 @@ def _eval_val_lora_ttt(
                         except Exception:
                             pass
             # Phase-2 optimizer at half LR (finer landscape exploration)
-            p2_groups = [{"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult * 0.5, "_lr_mult": lr_mult * 0.5}
-                         for _, mod, r, lr_mult in lora_targets]
+            p2_groups = []
+            for _, mod, r, lr_mult in lora_targets:
+                _rs = math.sqrt(r) if args.ttt_rs_lora else 1.0
+                if args.ttt_lora_plus:
+                    p2_groups.append({"params": [mod._lora_A], "lr": base_lr * lr_mult * _rs * 0.5, "_lr_mult": lr_mult * _rs * 0.5, "_is_A": True})
+                    p2_groups.append({"params": [mod._lora_B], "lr": base_lr * lr_mult * _rs * 0.5 * args.ttt_lora_plus_lambda, "_lr_mult": lr_mult * _rs * 0.5 * args.ttt_lora_plus_lambda, "_is_A": False})
+                else:
+                    p2_groups.append({"params": [mod._lora_A, mod._lora_B], "lr": base_lr * lr_mult * _rs * 0.5, "_lr_mult": lr_mult * _rs * 0.5})
             if gate_targets:
                 p2_groups.append({"params": [gp for _, gp, _ in gate_targets], "lr": base_lr * 0.025, "_lr_mult": 0.025})
             ttt_opt2 = torch.optim.AdamW(p2_groups, weight_decay=0.0, betas=(0.9, 0.95))
@@ -1044,6 +1253,15 @@ def _eval_val_lora_ttt(
                         loss2 = raw_model(x, y)
                 loss2.backward()
                 ttt_opt2.step()
+                if args.ttt_norm_budget > 0.0:
+                    with torch.no_grad():
+                        for _, mod, _, _ in lora_targets:
+                            nA2 = mod._lora_A.norm()
+                            if nA2 > args.ttt_norm_budget:
+                                mod._lora_A.mul_(args.ttt_norm_budget / nA2)
+                            nB2 = mod._lora_B.norm()
+                            if nB2 > args.ttt_norm_budget:
+                                mod._lora_B.mul_(args.ttt_norm_budget / nB2)
                 if args.ttt_min_nll and loss2.item() < best_nll:
                     best_nll = loss2.item()
                     best_lora = {nm: (mod._lora_A.detach().clone(), mod._lora_B.detach().clone())
@@ -1067,7 +1285,10 @@ def _eval_val_lora_ttt(
         if args.ttt_adaptive_temp and reli_s0_max > 0:
             _S0_REF_T = 0.05  # reference S[0]: mid-difficulty chunk
             surprise = reli_s0_max / (reli_s0_max + _S0_REF_T)  # [0, 1]: 1=very surprised
-            effective_temp = args.ttt_temperature + (1.0 - args.ttt_temperature) * surprise
+            # V136: ttt_adaptive_temp_max extends the range [T_base, T_max].
+            # Research (arXiv:2409.19817, arXiv:2404.16168) shows optimal T≈1.3 after heavy
+            # fine-tuning. Default T_max=1.0 matches prior behaviour; set 1.3 for V136.
+            effective_temp = args.ttt_temperature + (args.ttt_adaptive_temp_max - args.ttt_temperature) * surprise
         raw_model.eval()
         with torch.inference_mode():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):

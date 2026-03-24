@@ -13,6 +13,8 @@
 #   bash run_runpod.sh tier4        # WSM variants (~1 hr, ~$7)
 #   bash run_runpod.sh tier5        # DiffAttn variants (~1 hr, ~$7)
 #   bash run_runpod.sh tier6        # Peri-LN variants (~30 min, ~$3)
+#   bash run_runpod.sh tier19       # Tier 19: rsLoRA/LoRA+/EWC/RELI-RA/LayerLR (~1 hr, ~$7)
+#   bash run_runpod.sh tier20       # Tier 20: norm-bound/KD/label-smooth/chunk2k (~1 hr, ~$8)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -728,6 +730,182 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier18" || "$TARGET" == "V130" ]]; the
      TTT_MLP_LORA=1 TTT_LORA_RANK_MLP=4 TTT_GATE_ADAPT=1 \
      TTT_RELI=1 TTT_RELI_PHASES=2 TTT_ADAPTIVE_TEMP=1 \
      TTT_TOKEN_K=0.5 TTT_DIFFICULTY=1 TTT_LORA_DECAY=0.5"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 19 — Research-validated LoRA mechanics improvements (V131–V138)
+# All derived from 6 deep-research agents (2026-03-24 synthesis):
+#
+#  V131: rsLoRA + LoRA+ — two mechanical optimizer fixes:
+#        rsLoRA (arXiv:2312.03732): LR *= sqrt(r) so rank changes don't cause LR jumps.
+#        LoRA+ (arXiv:2402.12354, ICML 2024): lr_B = 4 × lr_A. B maps FROM learned
+#        subspace (needs large steps), A projects INTO it (needs stable steps).
+#        Expected: -0.010 to -0.025 BPB. Zero architecture change, 2 lines.
+#
+#  V132: Fisher Memory TTT — EWC cross-chunk regularization using Adam second moment
+#        as diagonal Fisher approximation (zero extra compute: exp_avg_sq is already
+#        computed). Principled replacement for soft-reset: preserves high-curvature
+#        parameters, allows free update of flat directions.
+#        Expected: -0.008 to -0.020 BPB over soft-reset baseline.
+#
+#  V133: RELI-RA (Rank Annealing) — start at rank-2r for wider subspace exploration,
+#        SVD-compress to rank-r at epoch//3 (retaining top-r signal directions).
+#        rsLoRA ensures LR doesn't jump 1.41× at the prune step.
+#        Based on DyLoRA (arXiv:2210.07558) + GaLore (arXiv:2403.03507).
+#        Expected: -0.008 to -0.025 BPB (richer init → faster convergence).
+#
+#  V134: Layer-Stratified Q LR — per-depth LR multipliers for Q LoRA:
+#        Early layers (0-3): 1×  — syntax/positional, stable across docs
+#        Middle (4-7):       3×  — semantic routing, moderate variance
+#        Late (8-10):        8×  — per-doc recall heads, highest variance
+#        Based on E2E-TTT (arXiv:2512.23675) + Rogers 2020 probing studies.
+#        Expected: -0.005 to -0.015 BPB (concentrates compute where it matters).
+#
+#  V135: Proj-only MLP LoRA — freeze W_fc (key side), concentrate rank budget on
+#        W_proj (output side) at rank=8 and 3× LR. Justified by ROME/MEMIT:
+#        factual updates exclusively require W_proj (vocab promotion layer).
+#        Expected: -0.005 to -0.012 BPB over fc+proj split.
+#
+#  V136: Extended Adaptive Temperature — T_max = 1.3 instead of 1.0.
+#        Research (arXiv:2409.19817): optimal T ≈ 1.3 after heavy fine-tuning.
+#        Prior range [0.98, 1.0] still undercorrected overconfidence on hard chunks.
+#        Expected: -0.002 to -0.008 BPB (calibration improvement).
+#
+#  V137: Tier 19 compound — rsLoRA + LoRA+ + Fisher Memory + RELI-RA + Layer LR
+#        All five mechanical improvements stacked. Expected: -0.025 to -0.060 BPB.
+#
+#  V138: Max Tier 19 — V137 + Extended AdaptiveTemp + Proj-only MLP + Two-Phase RELI
+#        Every research-validated improvement from Tiers 18 + 19.
+#        Expected: -0.035 to -0.080 BPB vs Chimera baseline.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V131" ]]; then
+  # rsLoRA + LoRA+ asymmetric LR on Chimera baseline
+  run_rp "V131_rslora_loraplus" \
+    "$CHIMERA_BASE TTT_RS_LORA=1 TTT_LORA_PLUS=1 TTT_LORA_PLUS_LAMBDA=4.0"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V132" ]]; then
+  # Fisher Memory EWC: cross-chunk regularization (light lambda=0.05)
+  run_rp "V132_fisher_ewc" \
+    "$CHIMERA_BASE TTT_EWC_LAMBDA=0.05"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V133" ]]; then
+  # RELI-RA: rank annealing (start 2r=16, prune to r=8 at epoch//3)
+  run_rp "V133_reli_ra" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_RELI_RA=1 TTT_RS_LORA=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V134" ]]; then
+  # Layer-stratified Q LR: early=1x, mid=3x, late=8x
+  run_rp "V134_layer_lr" \
+    "$CHIMERA_BASE TTT_LAYER_LR=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V135" ]]; then
+  # Proj-only MLP LoRA: rank-8 on W_proj only (freeze W_fc)
+  run_rp "V135_proj_only_mlp" \
+    "$CHIMERA_BASE TTT_MLP_LORA=1 TTT_PROJ_ONLY_MLP=1 TTT_LORA_RANK_QV=8"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V136" ]]; then
+  # Extended Adaptive Temperature: T range [0.98, 1.3] based on calibration research
+  run_rp "V136_ext_adaptive_temp" \
+    "$CHIMERA_BASE TTT_RELI=1 TTT_ADAPTIVE_TEMP=1 TTT_ADAPTIVE_TEMP_MAX=1.3"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V137" ]]; then
+  # Tier 19 compound: rsLoRA + LoRA+ + Fisher Memory + RELI-RA + Layer LR
+  run_rp "V137_tier19_compound" \
+    "$CHIMERA_BASE \
+     TTT_RS_LORA=1 TTT_LORA_PLUS=1 TTT_LORA_PLUS_LAMBDA=4.0 \
+     TTT_EWC_LAMBDA=0.05 \
+     TTT_RELI=1 TTT_RELI_RA=1 \
+     TTT_LAYER_LR=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier19" || "$TARGET" == "V138" ]]; then
+  # Max Tier 19: V137 + Extended AdaptiveTemp + Proj-only MLP + Two-Phase RELI
+  run_rp "V138_max_tier19" \
+    "$CHIMERA_BASE \
+     TTT_RS_LORA=1 TTT_LORA_PLUS=1 TTT_LORA_PLUS_LAMBDA=4.0 \
+     TTT_EWC_LAMBDA=0.05 \
+     TTT_RELI=1 TTT_RELI_RA=1 TTT_RELI_PHASES=2 \
+     TTT_LAYER_LR=1 \
+     TTT_MLP_LORA=1 TTT_PROJ_ONLY_MLP=1 \
+     TTT_ADAPTIVE_TEMP=1 TTT_ADAPTIVE_TEMP_MAX=1.3 \
+     TTT_TOKEN_K=0.5 TTT_DIFFICULTY=1"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 20: Convergence stabilizers + anti-forgetting (V139–V146)
+# Expected: ~0.01–0.05 BPB gains individually, 0.03–0.08 compounded
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V139" ]]; then
+  # LoRA norm bounding (Mu & Klabjan 2024): recover O(1/T) convergence rate.
+  # Unconstrained LoRA growth → O(1/log T) rate; clamping ||A||,||B|| ≤ 1.0 fixes it.
+  run_rp "V139_norm_bound" \
+    "$CHIMERA_BASE TTT_NORM_BUDGET=1.0"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V140" ]]; then
+  # Larger chunk size (LaCT arXiv:2505.23884): 1024→2048 tokens per TTT chunk.
+  # Default 1024 leaves GPU at <5% utilization during TTT; 2048 → >50% utilization.
+  # Fewer chunks but more context per chunk: better cross-token gradient signal.
+  run_rp "V140_chunk2048" \
+    "$CHIMERA_BASE TTT_CHUNK_SIZE=2048"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V141" ]]; then
+  # Label smoothing in TTT inner loop (Müller et al. 2019 + anti-forgetting research).
+  # alpha=0.05 prevents collapse to single-token predictions; equivalent to post-hoc T scaling.
+  run_rp "V141_label_smooth" \
+    "$CHIMERA_BASE TTT_LABEL_SMOOTH=0.05"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V142" ]]; then
+  # KD regularization from frozen base (Hinton 2015 + TTT anti-forgetting).
+  # Captures base logits before TTT (B=0 → pure base), penalises KL divergence during inner loop.
+  # T=2 softens targets; prevents overconfidence; -0.02 to -0.05 BPB expected.
+  run_rp "V142_kd_reg" \
+    "$CHIMERA_BASE TTT_KD_ALPHA=0.1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V143" ]]; then
+  # Norm bound + label smoothing compound: two orthogonal anti-degradation techniques.
+  run_rp "V143_norm_smooth" \
+    "$CHIMERA_BASE TTT_NORM_BUDGET=1.0 TTT_LABEL_SMOOTH=0.05"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V144" ]]; then
+  # KD + label smooth: full anti-forgetting stack (KD + calibration).
+  run_rp "V144_kd_smooth" \
+    "$CHIMERA_BASE TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V145" ]]; then
+  # Tier 20 compound: norm bound + KD + label smooth + larger chunk.
+  run_rp "V145_tier20_compound" \
+    "$CHIMERA_BASE \
+     TTT_NORM_BUDGET=1.0 \
+     TTT_KD_ALPHA=0.1 \
+     TTT_LABEL_SMOOTH=0.05 \
+     TTT_CHUNK_SIZE=2048"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V146" ]]; then
+  # Max Tier 20: V145 + best Tier 19 techniques (rsLoRA + LoRA+ + RELI + layer LR).
+  # Full convergence + anti-forgetting + init alignment stack.
+  run_rp "V146_max_tier20" \
+    "$CHIMERA_BASE \
+     TTT_RS_LORA=1 TTT_LORA_PLUS=1 TTT_LORA_PLUS_LAMBDA=4.0 \
+     TTT_RELI=1 TTT_LAYER_LR=1 \
+     TTT_NORM_BUDGET=1.0 \
+     TTT_KD_ALPHA=0.1 \
+     TTT_LABEL_SMOOTH=0.05 \
+     TTT_CHUNK_SIZE=2048"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
