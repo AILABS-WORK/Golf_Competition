@@ -15,6 +15,7 @@
 #   bash run_runpod.sh tier6        # Peri-LN variants (~30 min, ~$3)
 #   bash run_runpod.sh tier19       # Tier 19: rsLoRA/LoRA+/EWC/RELI-RA/LayerLR (~1 hr, ~$7)
 #   bash run_runpod.sh tier20       # Tier 20: norm-bound/KD/label-smooth/chunk2k (~1 hr, ~$8)
+#   bash run_runpod.sh tier21       # Tier 21: top-N layers + MLP-only TTT (~1 hr, ~$6)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -906,6 +907,53 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier20" || "$TARGET" == "V146" ]]; the
      TTT_KD_ALPHA=0.1 \
      TTT_LABEL_SMOOTH=0.05 \
      TTT_CHUNK_SIZE=2048"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 21: Layer targeting — top-N restriction + MLP-only (V147–V151)
+# Research: E2E-TTT, "Attention Retrieves MLP Memorizes", In-Place TTT (ICLR 2026)
+# Expected: -0.02–0.06 BPB (layer restriction is high-confidence)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V147" ]]; then
+  # Top-3 layer restriction: only layers 8-10 of 11 receive LoRA adapters.
+  # E2E-TTT + FLoE: 25% layer adaptation recovers 93%+ of full-model quality.
+  # Hypothesis: lower layers encode stable syntax → noise source in current setup.
+  run_rp "V147_top3_layers" \
+    "$CHIMERA_BASE TTT_TOP_LAYERS=3"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V148" ]]; then
+  # MLP-only TTT: freeze all attention Q/V in inner loop; adapt only MLP.
+  # E2E-TTT key finding: attention updates destabilize inner loop.
+  # "Attention Retrieves, MLP Memorizes": MLP is the TTT adaptation target.
+  run_rp "V148_mlp_only" \
+    "$CHIMERA_BASE TTT_MLP_ONLY=1 TTT_LORA_RANK_MLP=8"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V149" ]]; then
+  # In-Place TTT (ICLR 2026): W_down (proj) only — the MLP write-head.
+  # Combines V148 (MLP-only) + V135 (proj-only). Minimum rank budget, maximum signal.
+  run_rp "V149_wdown_only" \
+    "$CHIMERA_BASE TTT_MLP_ONLY=1 TTT_PROJ_ONLY_MLP=1 TTT_LORA_RANK_QV=8"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V150" ]]; then
+  # Top-3 layers + MLP-only: most targeted TTT variant.
+  # Only W_fc+W_proj in layers 8-10 get LoRA. All other params frozen.
+  run_rp "V150_top3_mlp_only" \
+    "$CHIMERA_BASE TTT_MLP_ONLY=1 TTT_LORA_RANK_MLP=8 TTT_TOP_LAYERS=3"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier21" || "$TARGET" == "V151" ]]; then
+  # Max Tier 21: Top-3 + W_down only + RELI + rsLoRA + KD + norm bound.
+  # Full research-validated stack from layer importance agent.
+  run_rp "V151_max_tier21" \
+    "$CHIMERA_BASE \
+     TTT_MLP_ONLY=1 TTT_PROJ_ONLY_MLP=1 TTT_LORA_RANK_QV=8 \
+     TTT_TOP_LAYERS=3 \
+     TTT_RELI=1 TTT_RS_LORA=1 TTT_LORA_PLUS=1 \
+     TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

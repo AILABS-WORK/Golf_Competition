@@ -322,6 +322,17 @@ class Hyperparameters:
     #   Prevents overconfidence and catastrophic interference. 3 lines of overhead.
     ttt_kd_alpha = float(os.environ.get("TTT_KD_ALPHA", 0.0))   # 0=off, 0.1=light
 
+    # ─── Tier 21 layer-targeting variants (V147–V151) ──────────────────────────
+    # V147: Top-N layer restriction (E2E-TTT arXiv:2512.23675 + FLoE arXiv:2506.00495).
+    #   Only the top N layers receive LoRA adapters. For 11-layer model, top-3 = layers 8-10.
+    #   Both papers show 25% layer adaptation = 93%+ of full-layer quality.
+    ttt_top_layers = int(os.environ.get("TTT_TOP_LAYERS", 0))    # 0=all, 3=top-3 only
+    # V148: MLP-only TTT (E2E-TTT key finding): freeze ALL attention in inner loop.
+    #   "Attention Retrieves, MLP Memorizes" (arXiv:2506.01115): MLP stores factual knowledge.
+    #   Attention-only LoRA underperforms MLP-only by 5-15% at any rank.
+    #   Mutually exclusive with TTT_Q_ONLY — MLP-only supersedes attention targeting.
+    ttt_mlp_only = bool(int(os.environ.get("TTT_MLP_ONLY", 0)))  # skip all attention LoRA
+
     # WSM — Warmup-Stable-Merge (arXiv:2507.17634).
     # Replaces LR warmdown entirely with constant-LR training + post-training checkpoint merge.
     # Key insight: merging N checkpoints from the stable-LR phase approximates LR decay
@@ -848,25 +859,31 @@ def _eval_val_lora_ttt(
 
     # Collect LoRA targets: (module_name, module, lora_rank, lr_multiplier)
     # Q-only mode (TTT_Q_ONLY): adapt only c_q, inspired by qTTT (arXiv:2512.13898).
-    # Rationale: Q controls "what to retrieve" without corrupting key/value document encodings.
     # V134: TTT_LAYER_LR stratifies Q LR by layer depth (early=1×, mid=3×, late=8×).
     # V135: TTT_PROJ_ONLY_MLP skips fc and uses rank_qv on proj only — ROME/MEMIT justified.
+    # V147: TTT_TOP_LAYERS restricts LoRA to top N layers only (E2E-TTT: top 25% = sufficient).
+    # V148: TTT_MLP_ONLY skips all attention LoRA, adapts only MLP layers.
     lora_targets: list[tuple[str, CastedLinear, int, float]] = []
     _n_layers = getattr(args, "num_layers", 11)
+    # V147: compute layer cutoff — layers below this index are frozen
+    _top_layer_cutoff = (_n_layers - args.ttt_top_layers) if args.ttt_top_layers > 0 else 0
     for name, mod in raw_model.named_modules():
         if not isinstance(mod, CastedLinear):
             continue
         tail = name.rsplit(".", 1)[-1]
-        # V134: parse layer index for depth-stratified Q LR
+        # Parse layer index for V134 depth-stratified LR and V147 top-layer restriction
         _layer_idx = -1
-        if args.ttt_layer_lr:
+        if args.ttt_layer_lr or args.ttt_top_layers > 0:
             try:
                 _parts = name.split(".")
                 _h_pos = next(i for i, p in enumerate(_parts) if p == "h")
                 _layer_idx = int(_parts[_h_pos + 1])
             except (StopIteration, IndexError, ValueError):
                 _layer_idx = -1
-        if tail == "c_q":
+        # V147: skip layers below the top-N cutoff
+        if args.ttt_top_layers > 0 and _layer_idx >= 0 and _layer_idx < _top_layer_cutoff:
+            continue
+        if tail == "c_q" and not args.ttt_mlp_only:
             if args.ttt_layer_lr and _layer_idx >= 0:
                 # E2E-TTT: last 1/3 layers drive semantic recall → highest LR
                 _late = int(_n_layers * 2 / 3)
@@ -875,16 +892,16 @@ def _eval_val_lora_ttt(
             else:
                 _q_lr = 1.0
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, _q_lr))
-        elif tail == "c_v" and not args.ttt_q_only:
+        elif tail == "c_v" and not args.ttt_q_only and not args.ttt_mlp_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 1.0))
-        elif tail == "c_k" and args.ttt_k_lora and not args.ttt_q_only:
+        elif tail == "c_k" and args.ttt_k_lora and not args.ttt_q_only and not args.ttt_mlp_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_qv, 0.3))
-        elif name == "lm_head" and not args.ttt_q_only:
+        elif name == "lm_head" and not args.ttt_q_only and not args.ttt_mlp_only:
             lora_targets.append((name, mod, args.ttt_lora_rank_lmhead, 1.0))
-        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "fc" and not args.ttt_proj_only_mlp:
+        elif (args.ttt_mlp_lora or args.ttt_mlp_only) and not args.ttt_q_only and tail == "fc" and not args.ttt_proj_only_mlp:
             # MLP fc: 0.5× LR — knowledge retrieval side (skip when proj-only)
             lora_targets.append((name, mod, args.ttt_lora_rank_mlp, 0.5))
-        elif args.ttt_mlp_lora and not args.ttt_q_only and tail == "proj" and ".mlp." in name:
+        elif (args.ttt_mlp_lora or args.ttt_mlp_only) and not args.ttt_q_only and tail == "proj" and ".mlp." in name:
             # V135 proj-only: use higher rank (rank_qv) on output proj; skip fc
             _mlp_rank = args.ttt_lora_rank_qv if args.ttt_proj_only_mlp else args.ttt_lora_rank_mlp
             lora_targets.append((name, mod, _mlp_rank, 3.0))
