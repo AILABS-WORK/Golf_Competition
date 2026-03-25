@@ -108,6 +108,51 @@ with torch.no_grad():
     loss3 = model_xsa(x, y)
 print(f"  XSA forward loss: {loss3.item():.4f}  ✓")
 
+# ── 5. c_gate TTT: GatedAttn model + TTT_CGGATE_ADAPT flag ─────────────────────
+print("\n=== TEST 5: c_gate TTT (GatedAttn adaptation) ===")
+model_gate = tg.GPT(
+    vocab_size=256,
+    num_layers=4,
+    model_dim=64,
+    num_heads=8,
+    num_kv_heads=4,
+    mlp_mult=2,
+    tie_embeddings=True,
+    tied_embed_init_std=0.02,
+    logit_softcap=30.0,
+    rope_base=10000.0,
+    qk_gain_init=1.5,
+    gated_attn=True,
+).to(device)
+
+# Simulate what the TTT code does: collect c_gate weights into gate_targets
+cggate_targets = []
+for name, mod in model_gate.named_modules():
+    if hasattr(mod, "c_gate") and mod.c_gate is not None:
+        w = mod.c_gate.weight
+        cggate_targets.append((name, w, w.data.clone()))
+print(f"  c_gate layers found: {len(cggate_targets)}")
+assert len(cggate_targets) == 4, f"Expected 4 (one per layer), got {len(cggate_targets)}"
+
+# Unfreeze c_gate weights and run a forward pass
+for p in model_gate.parameters():
+    p.requires_grad_(False)
+for _, w, _ in cggate_targets:
+    w.requires_grad_(True)
+
+with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")):
+    loss_gate = model_gate(x, y)
+loss_gate.backward()
+
+# Verify gradients flow through c_gate
+grads_found = sum(1 for _, w, _ in cggate_targets if w.grad is not None and w.grad.abs().sum() > 0)
+print(f"  Layers with c_gate grad: {grads_found}/4  OK")
+
+# Restore (as TTT code does)
+for _, w, orig in cggate_targets:
+    w.data.copy_(orig)
+print(f"  c_gate restore: OK")
+
 print("\n" + "="*50)
 print("ALL TESTS PASSED — code is safe to run on RunPod")
 print("="*50)

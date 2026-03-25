@@ -18,6 +18,7 @@
 #   bash run_runpod.sh tier21       # Tier 21: top-N layers + MLP-only TTT (~1 hr, ~$6)
 #   bash run_runpod.sh tier22       # Tier 22: Muon optimizer for LoRA adapters (~1 hr, ~$5)
 #   bash run_runpod.sh tier23       # Tier 23: XSA-aligned TTT + sequential gate (~1 hr, ~$6)
+#   bash run_runpod.sh tier24       # Tier 24: T>1 softening + c_gate TTT (GatedAttn) (~1 hr, ~$5)
 #   bash run_runpod.sh all          # everything (~5 hrs, ~$35)
 #   bash run_runpod.sh V47          # single variant by ID
 #
@@ -56,7 +57,10 @@ SOTA_BASE="NUM_LAYERS=11 MLP_MULT=3 SMEARGATE=1 \
   WARMDOWN_ITERS=3500"
 
 # SOTA + quantization (full 1.1233 stack)
-SOTA_QUANT="GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd"
+# STE_QAT=1 QAT_START_FRACTION=0.85 = late QAT from the record submission:
+#   fake-quantize weights in the last 15% of training so the model
+#   learns weights robust to int6 rounding. -0.0001 BPB per PR #414.
+SOTA_QUANT="GPTQ_LITE=1 QUANT_BITS=6 COMPRESS_METHOD=zstd STE_QAT=1 QAT_START_FRACTION=0.85"
 
 # ─── RUN FUNCTION ─────────────────────────────────────────────────────────────
 run_rp() {
@@ -1046,6 +1050,67 @@ if [[ "$TARGET" == "all" || "$TARGET" == "tier22" || "$TARGET" == "V154" ]]; the
      TTT_TOP_LAYERS=3 \
      TTT_RELI=1 TTT_RS_LORA=1 \
      TTT_NORM_BUDGET=1.0 TTT_KD_ALPHA=0.1 TTT_LABEL_SMOOTH=0.05"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIER 24 — Temperature softening + c_gate TTT (GatedAttn head-gate adaptation)
+# (~5 variants, ~1 hr, ~$5)
+#
+# Motivation (from 2026-03-24 research swarm):
+#   Temperature: Post-TTT models are overconfident (Guo 2017, ATS 2025, DEC 2024).
+#     T=0.98 SHARPENS an already-overconfident distribution — directionally wrong.
+#     Research shows optimal T ≈ 1.3 for RLHF-tuned models; TTT is more extreme.
+#     V161-V162: test fixed T=1.02 and T=1.05 (gentle softening).
+#
+#   c_gate TTT: GatedAttn (arXiv:2505.06708) adds per-head sigmoid gate W_gate.
+#     Adapting W_gate during TTT = learning per-head suppression for this document.
+#     Orthogonal to Q-LoRA (Q controls *what* to retrieve, gate controls *how much*).
+#     No KV-cache invalidation. ~4K params/layer, tiny overhead.
+#     XSA research (2026-03-24): "Gate weight adaptation is a promising orthogonal axis."
+#     V163: GATED_ATTN baseline (train with gated arch, standard TTT).
+#     V164: + TTT_CGGATE_ADAPT=1 (adapt c_gate during TTT).
+#     V165: Max Tier 24 — T=1.02 + GATED_ATTN + c_gate TTT + top-4 + RELI + rsLoRA.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier24" || "$TARGET" == "V161" ]]; then
+  # Post-TTT overconfidence fix: T=1.02 softening.
+  # Research (arXiv:2409.19817, arXiv:2404.16168) shows TTT increases confidence
+  # faster than accuracy → optimal T > 1.0. Current T=0.98 is directionally wrong.
+  run_rp "V161_temp_soften_102" \
+    "$CHIMERA_BASE TTT_TEMPERATURE=1.02"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier24" || "$TARGET" == "V162" ]]; then
+  # T=1.05: slightly more aggressive softening.
+  run_rp "V162_temp_soften_105" \
+    "$CHIMERA_BASE TTT_TEMPERATURE=1.05"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier24" || "$TARGET" == "V163" ]]; then
+  # GatedAttn baseline: train with GATED_ATTN=1, standard Chimera TTT (no c_gate adapt).
+  # Establishes whether gated attention improves the base model before adding c_gate TTT.
+  run_rp "V163_gated_attn_baseline" \
+    "$CHIMERA_BASE GATED_ATTN=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier24" || "$TARGET" == "V164" ]]; then
+  # c_gate TTT: GatedAttn model + adapt W_gate during TTT.
+  # TTT_CGGATE_ADAPT=1 unfreezes c_gate.weight in each attention block.
+  # Per-head sigmoid gate learns to suppress irrelevant heads for this document.
+  # Orthogonal to Q-LoRA: zero overlap in parameter space.
+  run_rp "V164_cggate_ttt" \
+    "$CHIMERA_BASE GATED_ATTN=1 TTT_CGGATE_ADAPT=1"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "tier24" || "$TARGET" == "V165" ]]; then
+  # Max Tier 24: T=1.02 + GATED_ATTN + c_gate TTT + top-4 layers + RELI + rsLoRA.
+  # Combines post-TTT calibration (T=1.02), per-head gate adaptation, and best init.
+  run_rp "V165_max_tier24" \
+    "$CHIMERA_BASE \
+     TTT_TEMPERATURE=1.02 \
+     GATED_ATTN=1 TTT_CGGATE_ADAPT=1 \
+     TTT_TOP_LAYERS=4 \
+     TTT_RELI=1 TTT_RS_LORA=1 TTT_LORA_PLUS=1 TTT_LORA_PLUS_LAMBDA=4.0"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

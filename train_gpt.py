@@ -242,6 +242,7 @@ class Hyperparameters:
     ttt_mlp_lora = bool(int(os.environ.get("TTT_MLP_LORA", 0)))
     ttt_lora_rank_mlp = int(os.environ.get("TTT_LORA_RANK_MLP", 4))  # rank for MLP LoRA
     ttt_gate_adapt = bool(int(os.environ.get("TTT_GATE_ADAPT", 0)))   # adapt attn/mlp scales
+    ttt_cggate_adapt = bool(int(os.environ.get("TTT_CGGATE_ADAPT", 0)))  # adapt c_gate W (GatedAttn head gate matrix)
     ttt_lora_decay = float(os.environ.get("TTT_LORA_DECAY", 0.0))     # soft-reset decay (0=hard reset)
     ttt_difficulty = bool(int(os.environ.get("TTT_DIFFICULTY", 0)))   # difficulty-adaptive epochs
     ttt_reli = bool(int(os.environ.get("TTT_RELI", 0)))               # RELI grad-aligned LoRA init
@@ -959,7 +960,7 @@ def _eval_val_lora_ttt(
             _mlp_rank = args.ttt_lora_rank_qv if args.ttt_proj_only_mlp else args.ttt_lora_rank_mlp
             lora_targets.append((name, mod, _mlp_rank, 3.0))
 
-    # Collect gate adaptation targets: Block-level attn_scale / mlp_scale
+    # Collect gate adaptation targets: Block-level attn_scale / mlp_scale + c_gate weights
     gate_targets: list[tuple[str, nn.Parameter, Tensor]] = []  # (name, param, saved_orig)
     if args.ttt_gate_adapt:
         for name, mod in raw_model.named_modules():
@@ -968,6 +969,16 @@ def _eval_val_lora_ttt(
                 gate_targets.append(("attn_scale@" + name, mod.attn_scale, mod.attn_scale.data.clone()))
             if hasattr(mod, "mlp_scale") and isinstance(mod.mlp_scale, nn.Parameter):
                 gate_targets.append(("mlp_scale@" + name, mod.mlp_scale, mod.mlp_scale.data.clone()))
+    if args.ttt_cggate_adapt:
+        # c_gate: CastedLinear(dim→num_heads) per-head sigmoid gate weight (arXiv:2505.06708).
+        # Adapting W_gate during TTT learns per-head attention suppression coefficients for the
+        # current document. XSA research (2026-03-24) confirms this is an orthogonal axis to
+        # Q-LoRA: Q controls *what* to retrieve; W_gate controls *how much* each head contributes.
+        # No KV-cache invalidation. Very few params: dim×num_heads per layer (~4K params/layer).
+        for name, mod in raw_model.named_modules():
+            if hasattr(mod, "c_gate") and mod.c_gate is not None:
+                w = mod.c_gate.weight  # nn.Parameter via CastedLinear
+                gate_targets.append(("cggate@" + name, w, w.data.clone()))
 
     # Freeze all base parameters (only LoRA A/B + gates will receive gradients)
     for p in raw_model.parameters():
